@@ -14,10 +14,20 @@ class BinaryWrapper:
 
         _setup_function_signatures(self.cdll)
 
-    def set_config(self, *, tag: str, interesting_region: bool, enable_cpu_backup: bool):
+    def set_config(
+            self,
+            *,
+            tag: str,
+            interesting_region: bool,
+            enable_cpu_backup: bool,
+            artifact_backend: str,
+            artifact_path: str,
+    ):
         self.cdll.tms_set_current_tag(tag.encode("utf-8"))
         self.cdll.tms_set_interesting_region(interesting_region)
         self.cdll.tms_set_enable_cpu_backup(enable_cpu_backup)
+        self.cdll.tms_set_artifact_backend(artifact_backend.encode("utf-8"))
+        self.cdll.tms_set_artifact_path(artifact_path.encode("utf-8"))
 
 
 def _setup_function_signatures(cdll):
@@ -28,8 +38,13 @@ def _setup_function_signatures(cdll):
     cdll.tms_get_interesting_region.restype = ctypes.c_bool
     cdll.tms_set_enable_cpu_backup.argtypes = [ctypes.c_bool]
     cdll.tms_get_enable_cpu_backup.restype = ctypes.c_bool
+    cdll.tms_set_artifact_backend.argtypes = [ctypes.c_char_p]
+    cdll.tms_get_artifact_backend.restype = ctypes.c_char_p
+    cdll.tms_set_artifact_path.argtypes = [ctypes.c_char_p]
+    cdll.tms_get_artifact_path.restype = ctypes.c_char_p
     cdll.tms_pause.argtypes = [ctypes.c_char_p]
     cdll.tms_resume.argtypes = [ctypes.c_char_p]
+    cdll.tms_preload.argtypes = [ctypes.c_char_p]
     cdll.set_memory_margin_bytes.argtypes = [ctypes.c_uint64]
     cdll.tms_get_cpu_backup_pointer.argtypes = [ctypes.POINTER(ctypes.c_uint8), ctypes.c_uint64]
     cdll.tms_get_cpu_backup_pointer.restype = ctypes.POINTER(ctypes.c_uint8)

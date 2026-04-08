@@ -23,24 +23,41 @@ class TorchMemorySaver:
         self._impl: Optional[_TorchMemorySaverImpl] = None
 
     @contextmanager
-    def region(self, tag: str = _TAG_DEFAULT, enable_cpu_backup: bool = False):
+    def region(
+            self,
+            tag: str = _TAG_DEFAULT,
+            enable_cpu_backup: bool = False,
+            artifact_backend: Optional[str] = None,
+            artifact_path: Optional[str] = None,
+    ):
         """Context manager for memory saving with optional tag"""
         self._ensure_initialized()
-        with self._impl.region(tag=tag, enable_cpu_backup=enable_cpu_backup):
+        with self._impl.region(
+                tag=tag,
+                enable_cpu_backup=enable_cpu_backup,
+                artifact_backend=artifact_backend,
+                artifact_path=artifact_path,
+        ):
             yield
 
     @contextmanager
     def cuda_graph(
             self,
             cuda_graph, pool=None, stream=None, capture_error_mode='global',
-            tag: str = _TAG_DEFAULT, enable_cpu_backup: bool = False,
+            tag: str = _TAG_DEFAULT,
+            enable_cpu_backup: bool = False,
+            artifact_backend: Optional[str] = None,
+            artifact_path: Optional[str] = None,
     ):
         """Similar to `torch.cuda.graph`, but ensures memory in it to be pauseable."""
         self._ensure_initialized()
         with self._impl.cuda_graph(
                 cuda_graph=cuda_graph,
                 pool=pool, stream=stream, capture_error_mode=capture_error_mode,
-                tag=tag, enable_cpu_backup=enable_cpu_backup,
+                tag=tag,
+                enable_cpu_backup=enable_cpu_backup,
+                artifact_backend=artifact_backend,
+                artifact_path=artifact_path,
         ):
             yield
 
@@ -59,6 +76,11 @@ class TorchMemorySaver:
         """Resume memory for specific tag or all memory if tag is None"""
         self._ensure_initialized()
         self._impl.resume(tag=tag)
+
+    def preload(self, tag: Optional[str] = None):
+        """Start asynchronous disk prefetch into the disk resume ring buffer."""
+        self._ensure_initialized()
+        self._impl.preload(tag=tag)
 
     # for compatibility
     @property
@@ -109,39 +131,93 @@ class _TorchMemorySaverImpl:
             atexit.register(self._mem_pools.clear)
 
     @contextmanager
-    def region(self, tag: str, enable_cpu_backup: bool):
+    def region(
+            self,
+            tag: str,
+            enable_cpu_backup: bool,
+            artifact_backend: Optional[str],
+            artifact_path: Optional[str],
+    ):
         # For hook_mode=preload, we need this b/c https://github.com/fzyzcjy/torch_memory_saver/pull/20#issuecomment-3047099047
         # (For hook_mode=torch we may not need it, but currently our primary usage is hook_mode=preload, thus we do this for simplicity)
-        mem_pool = self._mem_pools[(tag, enable_cpu_backup)]
+        artifact_backend, artifact_path = _normalize_artifact_options(
+            enable_cpu_backup=enable_cpu_backup,
+            artifact_backend=artifact_backend,
+            artifact_path=artifact_path,
+        )
+        mem_pool = self._mem_pools[(tag, enable_cpu_backup, artifact_backend, artifact_path)]
         with torch.cuda.use_mem_pool(mem_pool):
-            with self._with_region_config(tag=tag, enable_cpu_backup=enable_cpu_backup):
+            with self._with_region_config(
+                    tag=tag,
+                    enable_cpu_backup=enable_cpu_backup,
+                    artifact_backend=artifact_backend,
+                    artifact_path=artifact_path,
+            ):
                 yield
 
     @contextmanager
-    def cuda_graph(self, cuda_graph, pool, stream, capture_error_mode, tag: str, enable_cpu_backup: bool):
+    def cuda_graph(
+            self,
+            cuda_graph,
+            pool,
+            stream,
+            capture_error_mode,
+            tag: str,
+            enable_cpu_backup: bool,
+            artifact_backend: Optional[str],
+            artifact_path: Optional[str],
+    ):
         assert self._hook_mode == "preload", "Only hook_mode=preload supports pauseable CUDA Graph currently"
+        artifact_backend, artifact_path = _normalize_artifact_options(
+            enable_cpu_backup=enable_cpu_backup,
+            artifact_backend=artifact_backend,
+            artifact_path=artifact_path,
+        )
         with torch.cuda.graph(cuda_graph, pool=pool, stream=stream, capture_error_mode=capture_error_mode):
-            with self._with_region_config(tag=tag, enable_cpu_backup=enable_cpu_backup):
+            with self._with_region_config(
+                    tag=tag,
+                    enable_cpu_backup=enable_cpu_backup,
+                    artifact_backend=artifact_backend,
+                    artifact_path=artifact_path,
+            ):
                 yield
 
     @contextmanager
-    def _with_region_config(self, tag: str, enable_cpu_backup: bool):
+    def _with_region_config(
+            self,
+            tag: str,
+            enable_cpu_backup: bool,
+            artifact_backend: str,
+            artifact_path: str,
+    ):
         cdll = self._binary_wrapper.cdll
         orig_tag = cdll.tms_get_current_tag().decode("utf-8")
         orig_interesting_region = cdll.tms_get_interesting_region()
         orig_enable_cpu_backup = cdll.tms_get_enable_cpu_backup()
+        orig_artifact_backend = cdll.tms_get_artifact_backend().decode("utf-8")
+        orig_artifact_path = cdll.tms_get_artifact_path().decode("utf-8")
 
-        self._binary_wrapper.set_config(tag=tag, interesting_region=True, enable_cpu_backup=enable_cpu_backup)
+        self._binary_wrapper.set_config(
+            tag=tag,
+            interesting_region=True,
+            enable_cpu_backup=enable_cpu_backup,
+            artifact_backend=artifact_backend,
+            artifact_path=artifact_path,
+        )
         try:
             yield
         finally:
             assert cdll.tms_get_interesting_region()
             assert cdll.tms_get_enable_cpu_backup() == enable_cpu_backup
             assert cdll.tms_get_current_tag().decode("utf-8") == tag
+            assert cdll.tms_get_artifact_backend().decode("utf-8") == artifact_backend
+            assert cdll.tms_get_artifact_path().decode("utf-8") == artifact_path
             self._binary_wrapper.set_config(
                 tag=orig_tag,
                 interesting_region=orig_interesting_region,
                 enable_cpu_backup=orig_enable_cpu_backup,
+                artifact_backend=orig_artifact_backend,
+                artifact_path=orig_artifact_path,
             )
 
     @contextmanager
@@ -167,6 +243,10 @@ class _TorchMemorySaverImpl:
     def resume(self, tag: Optional[str]):
         tag_bytes = tag.encode("utf-8") if tag else None
         self._binary_wrapper.cdll.tms_resume(tag_bytes)
+
+    def preload(self, tag: Optional[str]):
+        tag_bytes = tag.encode("utf-8") if tag else None
+        self._binary_wrapper.cdll.tms_preload(tag_bytes)
 
     def get_cpu_backup(self, x: torch.Tensor, zero_copy: bool = False):
         assert x.is_cuda, f"{x.device=}"
@@ -199,3 +279,24 @@ def _sanity_checks():
         raise RuntimeError(
             "TorchMemorySaver is disabled for the current process because expandable_segments is not supported yet."
         )
+
+
+def _normalize_artifact_options(
+        *,
+        enable_cpu_backup: bool,
+        artifact_backend: Optional[str],
+        artifact_path: Optional[str],
+) -> tuple[str, str]:
+    artifact_backend = artifact_backend or ""
+    artifact_path = artifact_path or ""
+
+    if artifact_backend not in {"", "ram", "disk"}:
+        raise ValueError(f"Unsupported artifact_backend={artifact_backend!r}")
+    if enable_cpu_backup and artifact_backend:
+        raise ValueError("enable_cpu_backup and artifact_backend are mutually exclusive")
+    if artifact_backend != "disk" and artifact_path:
+        raise ValueError("artifact_path is only supported with artifact_backend='disk'")
+    if artifact_backend == "disk" and not artifact_path:
+        raise ValueError("artifact_backend='disk' requires artifact_path")
+
+    return artifact_backend, artifact_path

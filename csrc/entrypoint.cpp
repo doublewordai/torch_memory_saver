@@ -32,11 +32,52 @@ public:
         enable_cpu_backup_ = value;
     }
 
+    const std::string& artifact_backend() {
+        if (!artifact_backend_.has_value()) {
+            artifact_backend_ = get_string_env_var("TMS_INIT_ARTIFACT_BACKEND");
+        }
+        return artifact_backend_.value();
+    }
+
+    void set_artifact_backend(const std::string& value) {
+        artifact_backend_ = value;
+    }
+
+    const std::string& artifact_path() {
+        if (!artifact_path_.has_value()) {
+            artifact_path_ = get_string_env_var("TMS_INIT_ARTIFACT_PATH");
+        }
+        return artifact_path_.value();
+    }
+
+    void set_artifact_path(const std::string& value) {
+        artifact_path_ = value;
+    }
+
 private:
     std::optional<bool> is_interesting_region_;
     std::optional<bool> enable_cpu_backup_;
+    std::optional<std::string> artifact_backend_;
+    std::optional<std::string> artifact_path_;
 };
 static thread_local ThreadLocalConfig thread_local_config;
+
+static ArtifactBackend parse_artifact_backend(const std::string& value) {
+    if (value.empty() || value == "none") {
+        return ArtifactBackend::NONE;
+    }
+    if (value == "ram") {
+        return ArtifactBackend::RAM;
+    }
+    if (value == "disk") {
+        return ArtifactBackend::DISK;
+    }
+    std::cerr << "[torch_memory_saver.cpp] Unsupported artifact backend "
+              << " value=" << value
+              << " file=" << __FILE__ << " func=" << __func__ << " line=" << __LINE__
+              << std::endl;
+    exit(1);
+}
 
 // ------------------------------------------------- entrypoints :: hook ------------------------------------------------
 
@@ -44,7 +85,13 @@ static thread_local ThreadLocalConfig thread_local_config;
 cudaError_t cudaMalloc(void **ptr, size_t size) {
     if (thread_local_config.is_interesting_region()) {
         return TorchMemorySaver::instance().malloc(
-            ptr, CUDAUtils::cu_ctx_get_device(), size, thread_local_config.current_tag_, thread_local_config.enable_cpu_backup());
+            ptr,
+            CUDAUtils::cu_ctx_get_device(),
+            size,
+            thread_local_config.current_tag_,
+            thread_local_config.enable_cpu_backup(),
+            parse_artifact_backend(thread_local_config.artifact_backend()),
+            thread_local_config.artifact_path());
     } else {
         return APIForwarder::call_real_cuda_malloc(ptr, size);
     }
@@ -66,7 +113,13 @@ void *tms_torch_malloc(ssize_t size, int device, cudaStream_t stream) {
     SIMPLE_CHECK(thread_local_config.is_interesting_region(), "only support interesting region");
     void *ptr;
     CUDA_ERROR_CHECK(TorchMemorySaver::instance().malloc(
-        &ptr, CUDAUtils::cu_device_get(device), size, thread_local_config.current_tag_, thread_local_config.enable_cpu_backup()));
+        &ptr,
+        CUDAUtils::cu_device_get(device),
+        size,
+        thread_local_config.current_tag_,
+        thread_local_config.enable_cpu_backup(),
+        parse_artifact_backend(thread_local_config.artifact_backend()),
+        thread_local_config.artifact_path()));
     return ptr;
 }
 
@@ -110,6 +163,22 @@ void tms_set_enable_cpu_backup(bool enable_cpu_backup) {
     thread_local_config.set_enable_cpu_backup(enable_cpu_backup);
 }
 
+const char* tms_get_artifact_backend() {
+    return thread_local_config.artifact_backend().c_str();
+}
+
+void tms_set_artifact_backend(const char* artifact_backend) {
+    thread_local_config.set_artifact_backend((artifact_backend != nullptr) ? std::string(artifact_backend) : std::string());
+}
+
+const char* tms_get_artifact_path() {
+    return thread_local_config.artifact_path().c_str();
+}
+
+void tms_set_artifact_path(const char* artifact_path) {
+    thread_local_config.set_artifact_path((artifact_path != nullptr) ? std::string(artifact_path) : std::string());
+}
+
 void set_memory_margin_bytes(uint64_t value) {
     TorchMemorySaver::instance().set_memory_margin_bytes(value);
 }
@@ -122,6 +191,11 @@ void tms_pause(const char* tag) {
 void tms_resume(const char* tag) {
     std::string tag_str = (tag != nullptr) ? std::string(tag) : "";
     TorchMemorySaver::instance().resume(tag_str);
+}
+
+void tms_preload(const char* tag) {
+    std::string tag_str = (tag != nullptr) ? std::string(tag) : "";
+    TorchMemorySaver::instance().preload(tag_str);
 }
 
 uint8_t* tms_get_cpu_backup_pointer(const uint8_t* gpu_ptr, uint64_t size) {
