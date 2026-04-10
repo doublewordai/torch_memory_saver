@@ -96,6 +96,10 @@ def monotonic_ns() -> int:
     return time.monotonic_ns()
 
 
+def gib(value: int) -> float:
+    return value / float(1024 ** 3)
+
+
 class TraceWriter:
     def __init__(self, path: str) -> None:
         self._path = path
@@ -275,6 +279,7 @@ class Entry:
     consumer_attached: bool = False
     completion_token: str = ""
     staging: bool = False
+
     def close(self) -> None:
         if self.shm_map is not None:
             self.shm_map.close()
@@ -298,6 +303,20 @@ class SharedRingLayout:
         self.mapped_size = align_up(self.headers_bytes + self.block_count * self.block_payload_bytes, K_HUGEPAGE_ALIGNMENT)
 
 
+@dataclass
+class DaemonStats:
+    lookup_total: int = 0
+    lookup_hit_ready: int = 0
+    lookup_hit_streaming: int = 0
+    lookup_miss: int = 0
+    lookup_error: int = 0
+    stage_started: int = 0
+    stage_completed: int = 0
+    stage_failed: int = 0
+    evictions: int = 0
+    bytes_staged_completed: int = 0
+
+
 class StageManager:
     def __init__(
         self,
@@ -306,6 +325,7 @@ class StageManager:
         trace_file: str,
         hugetlb_dir: str,
         require_hugetlb: bool,
+        socket_path: str,
         watch_dirs: list[str],
         scan_interval_s: float,
         max_staged_bytes: int,
@@ -315,13 +335,26 @@ class StageManager:
         self.lock = threading.Lock()
         self.entries: dict[str, Entry] = {}
         self.trace = TraceWriter(trace_file)
+        self.socket_path = socket_path
         self.hugetlb_dir = hugetlb_dir
         self.require_hugetlb = require_hugetlb
         self.watch_dirs = [str(Path(path)) for path in watch_dirs if path]
         self.scan_interval_s = scan_interval_s
         self.max_staged_bytes = max_staged_bytes
         self.stop_event = threading.Event()
+        self.stats = DaemonStats()
         self.scan_thread: Optional[threading.Thread] = None
+        self._log_event(
+            "daemon_start",
+            socket_path=self.socket_path,
+            watch_dirs=self.watch_dirs,
+            hugetlb_dir=self.hugetlb_dir,
+            require_hugetlb=self.require_hugetlb,
+            block_bytes=self.layout.block_payload_bytes,
+            block_count=self.layout.block_count,
+            mapped_size=self.layout.mapped_size,
+            max_staged_bytes=self.max_staged_bytes,
+        )
         if self.watch_dirs:
             self.scan_thread = threading.Thread(target=self._scan_loop, daemon=True)
             self.scan_thread.start()
@@ -345,6 +378,26 @@ class StageManager:
     def _current_staged_bytes(self) -> int:
         return sum(self._entry_mapped_bytes(entry) for entry in self.entries.values())
 
+    def _stats_snapshot_locked(self) -> dict[str, object]:
+        return {
+            "lookup_total": self.stats.lookup_total,
+            "lookup_hit_ready": self.stats.lookup_hit_ready,
+            "lookup_hit_streaming": self.stats.lookup_hit_streaming,
+            "lookup_miss": self.stats.lookup_miss,
+            "lookup_error": self.stats.lookup_error,
+            "stage_started": self.stats.stage_started,
+            "stage_completed": self.stats.stage_completed,
+            "stage_failed": self.stats.stage_failed,
+            "evictions": self.stats.evictions,
+            "bytes_staged_completed": self.stats.bytes_staged_completed,
+            "current_staged_bytes": self._current_staged_bytes(),
+            "entry_count": len(self.entries),
+        }
+
+    def _log_event(self, event: str, **fields: object) -> None:
+        payload = {"event": event, "ts_ns": monotonic_ns(), **fields}
+        print(f"[torch_memory_saver.shm_daemon] {json.dumps(payload, sort_keys=True, separators=(',', ':'))}", flush=True)
+
     def _evict_if_needed(self, bytes_needed: int) -> None:
         if self.max_staged_bytes <= 0:
             return
@@ -358,6 +411,16 @@ class StageManager:
                 raise RuntimeError("hugepage staging budget exhausted")
             victim = min(candidates, key=lambda entry: entry.last_access_ns)
             self.entries.pop(victim.signature, None)
+            self.stats.evictions += 1
+            self._log_event(
+                "evict_entry",
+                artifact_path=victim.artifact_path,
+                shm_name=victim.shm_name,
+                mapped_gib=round(gib(victim.mapped_size), 3),
+                current_staged_gib=round(gib(self._current_staged_bytes()), 3),
+                budget_gib=round(gib(self.max_staged_bytes), 3),
+                **self._stats_snapshot_locked(),
+            )
             victim.close()
 
     def _allocate_memfd(self, entry: Entry) -> tuple[int, mmap.mmap, int, str, Optional[str]]:
@@ -577,15 +640,48 @@ class StageManager:
         try:
             stat_result = os.stat(artifact_path)
         except FileNotFoundError:
+            with self.lock:
+                self.stats.lookup_total += 1
+                self.stats.lookup_miss += 1
+                snapshot = self._stats_snapshot_locked()
+            self._log_event("lookup_miss", artifact_path=artifact_path, expected_size=expected_size, reason="missing_artifact", **snapshot)
             return None
         if expected_size and stat_result.st_size < expected_size:
+            with self.lock:
+                self.stats.lookup_total += 1
+                self.stats.lookup_miss += 1
+                snapshot = self._stats_snapshot_locked()
+            self._log_event("lookup_miss", artifact_path=artifact_path, expected_size=expected_size, actual_size=stat_result.st_size, reason="size_too_small", **snapshot)
             return None
         marker = self._read_completion_marker_for_artifact(artifact_path)
         if marker is not None:
             entry = self.ensure_staged(artifact_path, marker)
             if entry is None:
+                with self.lock:
+                    self.stats.lookup_total += 1
+                    self.stats.lookup_miss += 1
+                    snapshot = self._stats_snapshot_locked()
+                self._log_event("lookup_miss", artifact_path=artifact_path, expected_size=expected_size, reason="ensure_staged_returned_none", **snapshot)
                 return None
             entry.last_access_ns = monotonic_ns()
+            with self.lock:
+                self.stats.lookup_total += 1
+                if entry.state == "ready":
+                    self.stats.lookup_hit_ready += 1
+                elif entry.state == "streaming":
+                    self.stats.lookup_hit_streaming += 1
+                else:
+                    self.stats.lookup_error += 1
+                snapshot = self._stats_snapshot_locked()
+            self._log_event(
+                "lookup_hit",
+                artifact_path=artifact_path,
+                expected_size=expected_size,
+                state=entry.state,
+                mapped_gib=round(gib(entry.mapped_size), 3),
+                artifact_gib=round(gib(entry.artifact_size), 3),
+                **snapshot,
+            )
             return entry
         signature = artifact_signature(artifact_path, stat_result)
         with self.lock:
@@ -598,10 +694,38 @@ class StageManager:
                 self._drop_entry_locked(entry)
                 entry = None
         if entry is None:
+            with self.lock:
+                self.stats.lookup_total += 1
+                self.stats.lookup_miss += 1
+                snapshot = self._stats_snapshot_locked()
+            self._log_event("lookup_miss", artifact_path=artifact_path, expected_size=expected_size, reason="not_staged", **snapshot)
             return None
         if expected_size and stat_result.st_size < expected_size:
+            with self.lock:
+                self.stats.lookup_total += 1
+                self.stats.lookup_miss += 1
+                snapshot = self._stats_snapshot_locked()
+            self._log_event("lookup_miss", artifact_path=artifact_path, expected_size=expected_size, actual_size=stat_result.st_size, reason="post_lookup_size_too_small", **snapshot)
             return None
         entry.last_access_ns = monotonic_ns()
+        with self.lock:
+            self.stats.lookup_total += 1
+            if entry.state == "ready":
+                self.stats.lookup_hit_ready += 1
+            elif entry.state == "streaming":
+                self.stats.lookup_hit_streaming += 1
+            else:
+                self.stats.lookup_error += 1
+            snapshot = self._stats_snapshot_locked()
+        self._log_event(
+            "lookup_hit",
+            artifact_path=artifact_path,
+            expected_size=expected_size,
+            state=entry.state,
+            mapped_gib=round(gib(entry.mapped_size), 3),
+            artifact_gib=round(gib(entry.artifact_size), 3),
+            **snapshot,
+        )
         return entry
 
     def _scan_loop(self) -> None:
@@ -648,8 +772,23 @@ class StageManager:
     def _stage_entry(self, entry: Entry, reuse_existing: bool = False) -> None:
         phase = "open_artifact"
         next_read_offset = 0
+        stage_start_ns = monotonic_ns()
         try:
             disk_read_mode = get_disk_read_mode()
+            with self.lock:
+                self.stats.stage_started += 1
+                snapshot = self._stats_snapshot_locked()
+            self._log_event(
+                "stage_start",
+                artifact_path=entry.artifact_path,
+                artifact_gib=round(gib(entry.artifact_size), 3),
+                mapped_gib=round(gib(entry.mapped_size), 3),
+                block_bytes=entry.block_payload_bytes,
+                block_count=entry.block_count,
+                disk_read_mode=disk_read_mode,
+                reuse_existing=reuse_existing,
+                **snapshot,
+            )
             with TraceScope(
                 self.trace,
                 "daemon",
@@ -710,6 +849,21 @@ class StageManager:
                     self._write_global(entry, producer_done=1)
                     entry.state = "ready"
                     entry.staging = False
+                    elapsed_s = (monotonic_ns() - stage_start_ns) / 1e9
+                    with self.lock:
+                        self.stats.stage_completed += 1
+                        self.stats.bytes_staged_completed += entry.artifact_size
+                        snapshot = self._stats_snapshot_locked()
+                    self._log_event(
+                        "stage_complete",
+                        artifact_path=entry.artifact_path,
+                        artifact_gib=round(gib(entry.artifact_size), 3),
+                        mapped_gib=round(gib(entry.mapped_size), 3),
+                        elapsed_s=round(elapsed_s, 6),
+                        gib_per_s=round(gib(entry.artifact_size) / elapsed_s, 3) if elapsed_s > 0 else 0.0,
+                        disk_read_mode=disk_read_mode,
+                        **snapshot,
+                    )
         except Exception as exc:  # noqa: BLE001
             try:
                 if entry.shm_map is not None:
@@ -724,9 +878,19 @@ class StageManager:
             entry.state = "error"
             entry.staging = False
             with self.lock:
+                self.stats.stage_failed += 1
                 current = self.entries.get(entry.signature)
                 if current is entry:
                     self.entries.pop(entry.signature, None)
+                snapshot = self._stats_snapshot_locked()
+            self._log_event(
+                "stage_failed",
+                artifact_path=entry.artifact_path,
+                phase=phase,
+                offset=next_read_offset,
+                error=str(exc),
+                **snapshot,
+            )
             print(
                 f"[torch_memory_saver.shm_daemon] stage failed path={entry.artifact_path} phase={phase} "
                 f"offset={next_read_offset} error={exc}\n{traceback.format_exc()}",
@@ -816,6 +980,7 @@ def main() -> None:
         block_bytes=args.block_bytes,
         block_count=args.block_count,
         trace_file=args.trace_file,
+        socket_path=str(socket_path),
         hugetlb_dir=args.hugetlb_dir,
         require_hugetlb=args.require_hugetlb,
         watch_dirs=args.watch_dirs.split(":") if args.watch_dirs else [],

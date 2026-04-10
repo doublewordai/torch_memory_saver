@@ -28,14 +28,16 @@ spec:
         - --watch-dirs
         - /var/lib/tms-checkpoints
         - --block-bytes
-        - "1073741824"
+        - "268435456"
         - --block-count
-        - "52"
+        - "96"
         env:
         - name: PYTHONDONTWRITEBYTECODE
           value: "1"
         - name: TMS_SHM_DAEMON_MAX_STAGED_BYTES
-          value: "68719476736"
+          value: "25769803776"
+        - name: TMS_SHM_DAEMON_DISK_READ_MODE
+          value: "direct"
         - name: TMS_SHM_DAEMON_TRACE_FILE
           value: /var/run/tms/tms-daemon.trace.json
         ports: []
@@ -43,11 +45,11 @@ spec:
           requests:
             cpu: "1"
             memory: "1Gi"
-            hugepages-2Mi: "64Gi"
+            hugepages-2Mi: "24Gi"
           limits:
             cpu: "4"
             memory: "4Gi"
-            hugepages-2Mi: "64Gi"
+            hugepages-2Mi: "24Gi"
         volumeMounts:
         - name: socket-dir
           mountPath: /var/run/tms
