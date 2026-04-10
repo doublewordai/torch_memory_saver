@@ -25,6 +25,7 @@ K_DEFAULT_SCAN_INTERVAL_S = 1.0
 K_DEFAULT_BLOCK_BYTES = 512 * 1024 * 1024
 K_DEFAULT_BLOCK_COUNT = 8
 K_DEFAULT_MAX_STAGED_BYTES = 0
+K_DEFAULT_DISK_READ_MODE = "direct"
 K_ARTIFACT_COMPLETE_SUFFIX = ".complete"
 K_DIRECT_IO_ALIGNMENT = 4096
 K_HUGEPAGE_ALIGNMENT = 2 * 1024 * 1024
@@ -46,6 +47,15 @@ K_BLOCK_HEADER_BYTES = struct.calcsize(K_BLOCK_FORMAT)
 
 def align_up(value: int, alignment: int) -> int:
     return ((value + alignment - 1) // alignment) * alignment
+
+
+def get_disk_read_mode() -> str:
+    mode = os.environ.get("TMS_SHM_DAEMON_DISK_READ_MODE", os.environ.get("TMS_DISK_READ_MODE", K_DEFAULT_DISK_READ_MODE))
+    if mode in {"", "direct"}:
+        return "direct"
+    if mode == "buffered":
+        return "buffered"
+    raise RuntimeError(f"unsupported disk read mode: {mode}")
 
 
 def artifact_signature(path: str, stat_result: os.stat_result) -> str:
@@ -169,6 +179,79 @@ class Libc:
             current_offset += read_bytes
 
 
+class ArtifactReader(contextlib.AbstractContextManager):
+    def advise_sequential(self) -> None:
+        return
+
+    def read_into(self, address: int, valid_bytes: int, aligned_bytes: int, offset: int) -> None:
+        raise NotImplementedError
+
+    def close(self) -> None:
+        return
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+        return False
+
+
+class DirectArtifactReader(ArtifactReader):
+    def __init__(self, path: str, libc: Libc) -> None:
+        self.path = path
+        self.libc = libc
+        self.fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
+
+    def advise_sequential(self) -> None:
+        os.posix_fadvise(self.fd, 0, 0, os.POSIX_FADV_SEQUENTIAL)
+        os.posix_fadvise(self.fd, 0, 0, os.POSIX_FADV_WILLNEED)
+
+    def read_into(self, address: int, valid_bytes: int, aligned_bytes: int, offset: int) -> None:
+        self.libc.pread_into(self.fd, address, aligned_bytes, offset)
+
+    def close(self) -> None:
+        if self.fd >= 0:
+            try:
+                os.posix_fadvise(self.fd, 0, 0, os.POSIX_FADV_DONTNEED)
+            except OSError:
+                pass
+            os.close(self.fd)
+            self.fd = -1
+
+
+class BufferedArtifactReader(ArtifactReader):
+    def __init__(self, path: str, artifact_size: int) -> None:
+        self.path = path
+        self.artifact_size = artifact_size
+        self.padded_size = align_up(max(artifact_size, 1), K_DIRECT_IO_ALIGNMENT)
+        self.fd = os.open(path, os.O_RDONLY)
+        os.posix_fadvise(self.fd, 0, 0, os.POSIX_FADV_SEQUENTIAL)
+        os.posix_fadvise(self.fd, 0, 0, os.POSIX_FADV_WILLNEED)
+        self.map = mmap.mmap(self.fd, self.padded_size, access=mmap.ACCESS_COPY)
+        self.address = ctypes.addressof(ctypes.c_char.from_buffer(self.map))
+        try:
+            libc = ctypes.CDLL(None, use_errno=True)
+            libc.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+            libc.madvise.restype = ctypes.c_int
+            MADV_SEQUENTIAL = 2
+            MADV_WILLNEED = 3
+            libc.madvise(ctypes.c_void_p(self.address), ctypes.c_size_t(self.padded_size), ctypes.c_int(MADV_SEQUENTIAL))
+            libc.madvise(ctypes.c_void_p(self.address), ctypes.c_size_t(self.padded_size), ctypes.c_int(MADV_WILLNEED))
+        except Exception:
+            pass
+
+    def read_into(self, address: int, valid_bytes: int, aligned_bytes: int, offset: int) -> None:
+        ctypes.memmove(address, self.address + offset, valid_bytes)
+        if aligned_bytes > valid_bytes:
+            ctypes.memset(address + valid_bytes, 0, aligned_bytes - valid_bytes)
+
+    def close(self) -> None:
+        if self.map is not None:
+            self.map.close()
+            self.map = None
+        if self.fd >= 0:
+            os.close(self.fd)
+            self.fd = -1
+
+
 @dataclass
 class Entry:
     artifact_path: str
@@ -192,7 +275,6 @@ class Entry:
     consumer_attached: bool = False
     completion_token: str = ""
     staging: bool = False
-
     def close(self) -> None:
         if self.shm_map is not None:
             self.shm_map.close()
@@ -557,13 +639,28 @@ class StageManager:
         except FileNotFoundError:
             return None
 
+    def _open_artifact_reader(self, entry: Entry) -> ArtifactReader:
+        mode = get_disk_read_mode()
+        if mode == "buffered":
+            return BufferedArtifactReader(entry.artifact_path, entry.artifact_size)
+        return DirectArtifactReader(entry.artifact_path, self.libc)
+
     def _stage_entry(self, entry: Entry, reuse_existing: bool = False) -> None:
         phase = "open_artifact"
         next_read_offset = 0
         try:
-            with TraceScope(self.trace, "daemon", "stage_entry", artifact_path=entry.artifact_path, artifact_size=entry.artifact_size, block_payload_bytes=entry.block_payload_bytes, block_count=entry.block_count):
-                file_fd = os.open(entry.artifact_path, os.O_RDONLY | os.O_DIRECT)
-                try:
+            disk_read_mode = get_disk_read_mode()
+            with TraceScope(
+                self.trace,
+                "daemon",
+                "stage_entry",
+                artifact_path=entry.artifact_path,
+                artifact_size=entry.artifact_size,
+                block_payload_bytes=entry.block_payload_bytes,
+                block_count=entry.block_count,
+                disk_read_mode=disk_read_mode,
+            ):
+                with self._open_artifact_reader(entry) as reader:
                     if entry.shm_map is None or entry.shm_fd < 0 or entry.host_address == 0:
                         phase = "allocate_backing"
                         shm_fd, shm_map, host_address, backing_kind, backing_path = self._allocate_backing(entry)
@@ -579,8 +676,7 @@ class StageManager:
                     entry.state = "streaming"
 
                     phase = "posix_fadvise"
-                    os.posix_fadvise(file_fd, 0, 0, os.POSIX_FADV_SEQUENTIAL)
-                    os.posix_fadvise(file_fd, 0, 0, os.POSIX_FADV_WILLNEED)
+                    reader.advise_sequential()
                     sequence = 1
                     while next_read_offset < entry.artifact_size:
                         chosen_block = None
@@ -604,7 +700,7 @@ class StageManager:
                         payload_address = entry.host_address + self._payload_offset_for(entry, chosen_block)
                         phase = "pread_into"
                         with TraceScope(self.trace, "daemon", "disk_read_into_ring_block", artifact_path=entry.artifact_path, block_index=chosen_block, file_offset=next_read_offset, valid_bytes=valid_bytes, aligned_bytes=aligned_bytes):
-                            self.libc.pread_into(file_fd, payload_address, aligned_bytes, next_read_offset)
+                            reader.read_into(payload_address, valid_bytes, aligned_bytes, next_read_offset)
                         self._write_block(entry, chosen_block, K_BLOCK_STATE_READY, next_read_offset, valid_bytes, sequence)
                         next_read_offset += valid_bytes
                         sequence += 1
@@ -614,8 +710,6 @@ class StageManager:
                     self._write_global(entry, producer_done=1)
                     entry.state = "ready"
                     entry.staging = False
-                finally:
-                    os.close(file_fd)
         except Exception as exc:  # noqa: BLE001
             try:
                 if entry.shm_map is not None:
