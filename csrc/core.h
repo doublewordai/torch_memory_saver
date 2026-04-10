@@ -1,5 +1,6 @@
 #pragma once
 #include <sys/types.h>
+#include <cstdint>
 #include <stdio.h>
 #include <unordered_map>
 #include <atomic>
@@ -46,6 +47,45 @@ struct AllocationMetadata {
 #endif
 };
 
+struct SharedArtifactHostMapping {
+    std::string shm_name;
+    std::string completion_token;
+    void* mapping_base = nullptr;
+    void* payload_base = nullptr;
+    size_t artifact_size = 0;
+    size_t mapped_size = 0;
+    size_t payload_offset = 0;
+    size_t block_payload_bytes = 0;
+    size_t block_count = 0;
+    int shm_fd = -1;
+    bool cuda_registered = false;
+};
+
+struct SharedRingGlobalHeader {
+    char magic[8];
+    uint32_t version;
+    uint32_t header_bytes;
+    uint32_t block_header_bytes;
+    uint32_t block_count;
+    uint64_t block_payload_bytes;
+    uint64_t payload_offset;
+    uint64_t total_buffer_bytes;
+    uint64_t artifact_size;
+    uint64_t completion_generation;
+    uint32_t producer_done;
+    uint32_t consumer_state;
+    uint32_t error_code;
+    uint32_t reserved;
+};
+
+struct SharedRingBlockHeader {
+    uint32_t state;
+    uint32_t reserved0;
+    uint64_t file_offset;
+    uint64_t valid_bytes;
+    uint64_t sequence;
+};
+
 class TorchMemorySaver {
 public:
     static TorchMemorySaver& instance();
@@ -75,6 +115,7 @@ private:
 
     std::mutex allocator_metadata_mutex_;
     std::unordered_map<void*, AllocationMetadata> allocation_metadata_;
+    std::unordered_map<std::string, SharedArtifactHostMapping> shared_artifact_mappings_;
     std::unordered_map<std::string, std::shared_ptr<DiskPrefetchState>> disk_prefetch_states_;
     std::atomic<uint64_t> memory_margin_bytes_ = 0;
 };

@@ -5,10 +5,60 @@
 #include "api_forwarder.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstring>
+#include <fcntl.h>
+#include <fstream>
+#include <optional>
+#include <sstream>
+#include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
 #include <thread>
+#include <unistd.h>
 #include <unordered_map>
 
 namespace {
+
+constexpr const char* kShmDaemonSocketEnv = "TMS_SHM_DAEMON_SOCKET";
+constexpr const char* kShmLookupWaitMsEnv = "TMS_SHM_DAEMON_LOOKUP_WAIT_MS";
+constexpr const char* kArtifactCompleteSuffix = ".complete";
+constexpr size_t kCudaHostRegisterChunkBytes = 1ull << 30;
+constexpr size_t kSharedArtifactCopyChunkBytes = 128ull * 1024ull * 1024ull;
+constexpr const char kSharedRingMagic[8] = {'T', 'M', 'S', 'R', 'I', 'N', 'G', '\0'};
+constexpr uint32_t kSharedRingVersion = 1;
+constexpr uint32_t kSharedRingErrorGeneric = 1;
+
+enum class SharedRingBlockState : uint32_t {
+    FREE = 0,
+    WRITING = 1,
+    READY = 2,
+    READING = 3,
+    ERROR = 4,
+};
+
+enum class SharedRingConsumerState : uint32_t {
+    IDLE = 0,
+    ATTACHED = 1,
+    DONE = 2,
+};
+
+struct StagedArtifactInfo {
+    std::string shm_name;
+    std::string completion_token;
+    uint64_t artifact_size = 0;
+    uint64_t mapped_size = 0;
+    uint64_t block_count = 0;
+    uint64_t block_payload_bytes = 0;
+    uint64_t payload_offset = 0;
+    int shm_fd = -1;
+};
+
+struct DaemonResponse {
+    std::string line;
+    int received_fd = -1;
+};
 
 bool matches_tag(const std::string& filter_tag, const AllocationMetadata& metadata) {
     return filter_tag.empty() || metadata.tag == filter_tag;
@@ -16,6 +66,385 @@ bool matches_tag(const std::string& filter_tag, const AllocationMetadata& metada
 
 bool should_return_host_backup(const AllocationMetadata& metadata) {
     return metadata.enable_cpu_backup || metadata.cpu_backup != nullptr;
+}
+
+std::string get_shm_daemon_socket_path() {
+    return get_string_env_var(kShmDaemonSocketEnv);
+}
+
+std::string artifact_completion_marker_path(const std::string& artifact_path) {
+    return artifact_path + kArtifactCompleteSuffix;
+}
+
+bool artifact_completion_marker_exists(const std::string& artifact_path) {
+    struct stat st {};
+    return stat(artifact_completion_marker_path(artifact_path).c_str(), &st) == 0;
+}
+
+std::vector<std::string> split_tab_fields(const std::string& line) {
+    std::vector<std::string> fields;
+    std::stringstream stream(line);
+    std::string field;
+    while (std::getline(stream, field, '\t')) {
+        fields.push_back(field);
+    }
+    return fields;
+}
+
+std::string read_artifact_completion_token(const std::string& artifact_path) {
+    std::ifstream marker_file(artifact_completion_marker_path(artifact_path));
+    if (!marker_file.is_open()) {
+        return "";
+    }
+    std::string line;
+    std::getline(marker_file, line);
+    if (line.empty()) {
+        return "";
+    }
+    const std::vector<std::string> fields = split_tab_fields(line);
+    if (fields.size() >= 2) {
+        return fields[1];
+    }
+    return line;
+}
+
+uint32_t atomic_load_u32(const uint32_t* ptr) {
+    return __atomic_load_n(ptr, __ATOMIC_ACQUIRE);
+}
+
+void atomic_store_u32(uint32_t* ptr, uint32_t value) {
+    __atomic_store_n(ptr, value, __ATOMIC_RELEASE);
+}
+
+uint64_t atomic_load_u64(const uint64_t* ptr) {
+    return __atomic_load_n(ptr, __ATOMIC_ACQUIRE);
+}
+
+void atomic_store_u64(uint64_t* ptr, uint64_t value) {
+    __atomic_store_n(ptr, value, __ATOMIC_RELEASE);
+}
+
+SharedRingGlobalHeader* shared_ring_global_header(const SharedArtifactHostMapping& mapping) {
+    return static_cast<SharedRingGlobalHeader*>(mapping.mapping_base);
+}
+
+SharedRingBlockHeader* shared_ring_block_headers(const SharedArtifactHostMapping& mapping) {
+    return reinterpret_cast<SharedRingBlockHeader*>(static_cast<uint8_t*>(mapping.mapping_base) + sizeof(SharedRingGlobalHeader));
+}
+
+void* shared_ring_block_payload(const SharedArtifactHostMapping& mapping, size_t block_index) {
+    return static_cast<uint8_t*>(mapping.payload_base) + block_index * mapping.block_payload_bytes;
+}
+
+bool shared_ring_header_valid(const SharedRingGlobalHeader& header) {
+    return std::memcmp(header.magic, kSharedRingMagic, sizeof(header.magic)) == 0 &&
+           header.version == kSharedRingVersion &&
+           header.header_bytes == sizeof(SharedRingGlobalHeader) &&
+           header.block_header_bytes == sizeof(SharedRingBlockHeader);
+}
+
+bool cuda_host_register_chunked(void* host_buffer, size_t size, unsigned int flags) {
+    uint8_t* cursor = static_cast<uint8_t*>(host_buffer);
+    size_t remaining = size;
+    std::vector<void*> registered_ptrs;
+    while (remaining > 0) {
+        const size_t chunk = std::min(remaining, kCudaHostRegisterChunkBytes);
+        cudaError_t register_result = cudaHostRegister(cursor, chunk, flags);
+        if (register_result != cudaSuccess) {
+            for (void* registered_ptr : registered_ptrs) {
+                (void) cudaHostUnregister(registered_ptr);
+            }
+            return false;
+        }
+        registered_ptrs.push_back(cursor);
+        cursor += chunk;
+        remaining -= chunk;
+    }
+    return true;
+}
+
+void cuda_host_unregister_chunked(void* host_buffer, size_t size) {
+    uint8_t* cursor = static_cast<uint8_t*>(host_buffer);
+    size_t remaining = size;
+    while (remaining > 0) {
+        const size_t chunk = std::min(remaining, kCudaHostRegisterChunkBytes);
+        cudaError_t unregister_result = cudaHostUnregister(cursor);
+        SIMPLE_CHECK(unregister_result == cudaSuccess, "cudaHostUnregister failed for shared artifact mapping");
+        cursor += chunk;
+        remaining -= chunk;
+    }
+}
+
+std::optional<DaemonResponse> shm_daemon_request(
+    const std::string& command,
+    const std::string& artifact_path,
+    uint64_t artifact_size
+) {
+    const std::string socket_path = get_shm_daemon_socket_path();
+    if (socket_path.empty()) {
+        return std::nullopt;
+    }
+
+    const int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return std::nullopt;
+    }
+
+    sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    SIMPLE_CHECK(socket_path.size() < sizeof(addr.sun_path), "Daemon socket path too long");
+    std::snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", socket_path.c_str());
+
+    if (connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+        (void) close(fd);
+        return std::nullopt;
+    }
+
+    const std::string request = command + "\t" + artifact_path + "\t" + std::to_string(artifact_size) + "\n";
+    size_t sent = 0;
+    while (sent < request.size()) {
+        const ssize_t written = write(fd, request.data() + sent, request.size() - sent);
+        if (written < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            (void) close(fd);
+            return std::nullopt;
+        }
+        sent += static_cast<size_t>(written);
+    }
+
+    DaemonResponse response;
+    char buffer[1024];
+    char control[CMSG_SPACE(sizeof(int))];
+    iovec iov{};
+    iov.iov_base = buffer;
+    iov.iov_len = sizeof(buffer);
+    msghdr msg{};
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control;
+    msg.msg_controllen = sizeof(control);
+
+    while (true) {
+        const ssize_t n = recvmsg(fd, &msg, 0);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            if (response.received_fd >= 0) {
+                (void) close(response.received_fd);
+            }
+            (void) close(fd);
+            return std::nullopt;
+        }
+        if (n == 0) {
+            break;
+        }
+
+        response.line.append(buffer, buffer + n);
+        for (cmsghdr* cmsg = CMSG_FIRSTHDR(&msg); cmsg != nullptr; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+            if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS && cmsg->cmsg_len >= CMSG_LEN(sizeof(int))) {
+                int received_fd = -1;
+                std::memcpy(&received_fd, CMSG_DATA(cmsg), sizeof(int));
+                if (response.received_fd >= 0) {
+                    (void) close(response.received_fd);
+                }
+                response.received_fd = received_fd;
+            }
+        }
+
+        if (response.line.find('\n') != std::string::npos) {
+            break;
+        }
+
+        msg.msg_control = control;
+        msg.msg_controllen = sizeof(control);
+    }
+
+    (void) close(fd);
+    const size_t newline_pos = response.line.find('\n');
+    if (newline_pos != std::string::npos) {
+        response.line.resize(newline_pos);
+    }
+    if (response.line.empty()) {
+        if (response.received_fd >= 0) {
+            (void) close(response.received_fd);
+        }
+        return std::nullopt;
+    }
+    return response;
+}
+
+std::optional<StagedArtifactInfo> lookup_staged_artifact_once(
+    const std::string& artifact_path,
+    uint64_t artifact_size
+) {
+    std::optional<DaemonResponse> response = shm_daemon_request("lookup", artifact_path, artifact_size);
+    if (!response.has_value()) {
+        return std::nullopt;
+    }
+
+    const std::vector<std::string> fields = split_tab_fields(response->line);
+    if (fields.empty()) {
+        if (response->received_fd >= 0) {
+            (void) close(response->received_fd);
+        }
+        return std::nullopt;
+    }
+
+    if ((fields[0] != "streaming" && fields[0] != "ready") || fields.size() != 8 || response->received_fd < 0) {
+        if (response->received_fd >= 0) {
+            (void) close(response->received_fd);
+        }
+        return std::nullopt;
+    }
+
+    StagedArtifactInfo info;
+    info.shm_name = fields[1];
+    info.completion_token = fields[2];
+    info.artifact_size = static_cast<uint64_t>(std::stoull(fields[3]));
+    info.mapped_size = static_cast<uint64_t>(std::stoull(fields[4]));
+    info.block_count = static_cast<uint64_t>(std::stoull(fields[5]));
+    info.block_payload_bytes = static_cast<uint64_t>(std::stoull(fields[6]));
+    info.payload_offset = static_cast<uint64_t>(std::stoull(fields[7]));
+    info.shm_fd = response->received_fd;
+    return info;
+}
+
+std::optional<StagedArtifactInfo> lookup_staged_artifact(
+    const std::string& artifact_path,
+    uint64_t artifact_size
+) {
+    const uint64_t wait_ms = artifact_completion_marker_exists(artifact_path)
+        ? get_uint64_env_var(kShmLookupWaitMsEnv, 30000)
+        : 0;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(wait_ms);
+    while (true) {
+        const std::string expected_token = read_artifact_completion_token(artifact_path);
+        std::optional<StagedArtifactInfo> staged = lookup_staged_artifact_once(artifact_path, artifact_size);
+        if (staged.has_value() && (expected_token.empty() || staged->completion_token == expected_token)) {
+            return staged;
+        }
+        if (staged.has_value() && staged->shm_fd >= 0) {
+            (void) close(staged->shm_fd);
+        }
+        if (wait_ms == 0 || std::chrono::steady_clock::now() >= deadline) {
+            return std::nullopt;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+}
+
+void destroy_shared_artifact_mapping(SharedArtifactHostMapping& mapping) {
+    if (mapping.mapping_base != nullptr && mapping.cuda_registered) {
+        cuda_host_unregister_chunked(mapping.mapping_base, mapping.mapped_size);
+        mapping.cuda_registered = false;
+    }
+
+    if (mapping.mapping_base != nullptr) {
+        SharedRingGlobalHeader* header = shared_ring_global_header(mapping);
+        atomic_store_u32(&header->consumer_state, static_cast<uint32_t>(SharedRingConsumerState::DONE));
+        SIMPLE_CHECK(munmap(mapping.mapping_base, mapping.mapped_size) == 0, "munmap failed for shared artifact mapping");
+        mapping.mapping_base = nullptr;
+        mapping.payload_base = nullptr;
+    }
+
+    if (mapping.shm_fd >= 0) {
+        SIMPLE_CHECK(close(mapping.shm_fd) == 0, "close failed for shared artifact mapping");
+        mapping.shm_fd = -1;
+    }
+
+    mapping.artifact_size = 0;
+    mapping.mapped_size = 0;
+    mapping.payload_offset = 0;
+    mapping.block_payload_bytes = 0;
+    mapping.block_count = 0;
+    mapping.shm_name.clear();
+    mapping.completion_token.clear();
+}
+
+bool ensure_shared_artifact_mapping(
+    std::unordered_map<std::string, SharedArtifactHostMapping>& shared_artifact_mappings,
+    const std::string& artifact_path,
+    uint64_t artifact_size
+) {
+    const std::optional<StagedArtifactInfo> staged = lookup_staged_artifact(artifact_path, artifact_size);
+    if (!staged.has_value()) {
+        return false;
+    }
+
+    SharedArtifactHostMapping& mapping = shared_artifact_mappings[artifact_path];
+    if (mapping.mapping_base != nullptr &&
+        mapping.shm_name == staged->shm_name &&
+        mapping.completion_token == staged->completion_token &&
+        mapping.artifact_size == artifact_size &&
+        mapping.mapped_size == staged->mapped_size &&
+        mapping.block_count == staged->block_count &&
+        mapping.block_payload_bytes == staged->block_payload_bytes &&
+        mapping.payload_offset == staged->payload_offset) {
+        if (staged->shm_fd >= 0) {
+            (void) close(staged->shm_fd);
+        }
+        return true;
+    }
+
+    destroy_shared_artifact_mapping(mapping);
+
+    const int shm_fd = staged->shm_fd;
+    if (shm_fd < 0) {
+        shared_artifact_mappings.erase(artifact_path);
+        return false;
+    }
+
+    void* mapping_base = mmap(nullptr, staged->mapped_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+    if (mapping_base == MAP_FAILED) {
+        (void) close(shm_fd);
+        shared_artifact_mappings.erase(artifact_path);
+        return false;
+    }
+
+    SharedRingGlobalHeader* header = static_cast<SharedRingGlobalHeader*>(mapping_base);
+    if (!shared_ring_header_valid(*header) ||
+        header->total_buffer_bytes != staged->mapped_size ||
+        header->block_count != staged->block_count ||
+        header->block_payload_bytes != staged->block_payload_bytes ||
+        header->payload_offset != staged->payload_offset) {
+        (void) munmap(mapping_base, staged->mapped_size);
+        (void) close(shm_fd);
+        shared_artifact_mappings.erase(artifact_path);
+        return false;
+    }
+
+    if (!cuda_host_register_chunked(mapping_base, staged->mapped_size, cudaHostRegisterPortable)) {
+        (void) munmap(mapping_base, staged->mapped_size);
+        (void) close(shm_fd);
+        shared_artifact_mappings.erase(artifact_path);
+        return false;
+    }
+
+    mapping.shm_name = staged->shm_name;
+    mapping.completion_token = staged->completion_token;
+    mapping.mapping_base = mapping_base;
+    mapping.payload_base = static_cast<uint8_t*>(mapping_base) + staged->payload_offset;
+    mapping.artifact_size = static_cast<size_t>(artifact_size);
+    mapping.mapped_size = static_cast<size_t>(staged->mapped_size);
+    mapping.payload_offset = static_cast<size_t>(staged->payload_offset);
+    mapping.block_payload_bytes = static_cast<size_t>(staged->block_payload_bytes);
+    mapping.block_count = static_cast<size_t>(staged->block_count);
+    mapping.shm_fd = shm_fd;
+    mapping.cuda_registered = true;
+    atomic_store_u32(&header->consumer_state, static_cast<uint32_t>(SharedRingConsumerState::ATTACHED));
+    std::cout << "[torch_memory_saver.cpp] shared artifact mapping ready"
+              << " path=" << artifact_path
+              << " shm_name=" << mapping.shm_name
+              << " artifact_bytes=" << mapping.artifact_size
+              << " staged_file_bytes=" << staged->artifact_size
+              << " mapped_bytes=" << mapping.mapped_size
+              << " block_bytes=" << mapping.block_payload_bytes
+              << " block_count=" << mapping.block_count
+              << std::endl;
+    return true;
 }
 
 struct BatchMemcpyGroup {
@@ -40,6 +469,34 @@ void add_batch_copy(
     group.dsts.push_back(dst);
     group.srcs.push_back(src);
     group.sizes.push_back(size);
+}
+
+void add_registered_mapping_batch_copy(
+    std::unordered_map<int, BatchMemcpyGroup>& groups,
+    const SharedArtifactHostMapping& mapping,
+    CUdevice device,
+    void* dst,
+    void* src,
+    size_t size
+) {
+    uint8_t* dst_cursor = static_cast<uint8_t*>(dst);
+    uint8_t* src_cursor = static_cast<uint8_t*>(src);
+    size_t remaining = size;
+    uint8_t* mapping_base = static_cast<uint8_t*>(mapping.mapping_base);
+    const size_t mapping_bytes = mapping.mapped_size;
+
+    while (remaining > 0) {
+        SIMPLE_CHECK(src_cursor >= mapping_base, "shared mapping source pointer underflow");
+        const size_t src_offset = static_cast<size_t>(src_cursor - mapping_base);
+        SIMPLE_CHECK(src_offset < mapping_bytes, "shared mapping source pointer overflow");
+        const size_t chunk_offset = src_offset % kCudaHostRegisterChunkBytes;
+        const size_t chunk_remaining = kCudaHostRegisterChunkBytes - chunk_offset;
+        const size_t copy_bytes = std::min(remaining, std::min(chunk_remaining, kSharedArtifactCopyChunkBytes));
+        add_batch_copy(groups, device, dst_cursor, src_cursor, copy_bytes);
+        dst_cursor += copy_bytes;
+        src_cursor += copy_bytes;
+        remaining -= copy_bytes;
+    }
 }
 
 AsyncMemcpyContext create_async_memcpy_context() {
@@ -181,7 +638,8 @@ void record_disk_prefetch_slot_events(
 
 void run_batch_memcpy(
     std::unordered_map<int, BatchMemcpyGroup>& groups,
-    cudaMemcpyKind fallback_kind
+    cudaMemcpyKind fallback_kind,
+    bool allow_batch = true
 ) {
     if (groups.empty()) {
         return;
@@ -209,6 +667,7 @@ void run_batch_memcpy(
         CUDA_ERROR_CHECK(cudaSetDevice(device));
         cudaStream_t stream = streams_by_device.at(device);
 
+        if (allow_batch) {
 #if defined(USE_CUDA)
         cudaMemcpyAttributes attrs{};
         attrs.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
@@ -249,6 +708,17 @@ void run_batch_memcpy(
             ));
         }
 #endif
+        } else {
+            for (size_t i = 0; i < group.dsts.size(); ++i) {
+                CUDA_ERROR_CHECK(cudaMemcpyAsync(
+                    group.dsts[i],
+                    group.srcs[i],
+                    group.sizes[i],
+                    fallback_kind,
+                    stream
+                ));
+            }
+        }
     }
 
     for (const auto& entry : streams_by_device) {
@@ -297,6 +767,132 @@ void collect_slot_copies(
             allocation_offset = 0;
             ++allocation_index;
         }
+    }
+}
+
+void collect_shared_ring_block_copies(
+    const SharedArtifactHostMapping& mapping,
+    size_t block_index,
+    std::vector<AllocationRef>& path_items,
+    size_t& allocation_index,
+    size_t& allocation_offset,
+    std::unordered_map<int, BatchMemcpyGroup>& h2d_groups
+) {
+    SharedRingBlockHeader* block_headers = shared_ring_block_headers(mapping);
+    SharedRingBlockHeader& block = block_headers[block_index];
+    const uint64_t block_file_offset = atomic_load_u64(&block.file_offset);
+    const uint64_t block_valid_bytes = atomic_load_u64(&block.valid_bytes);
+    const uint64_t block_end = block_file_offset + block_valid_bytes;
+
+    while (allocation_index < path_items.size()) {
+        AllocationMetadata& metadata = *path_items[allocation_index].metadata;
+        const uint64_t allocation_file_offset = metadata.disk_backup_offset + allocation_offset;
+        if (allocation_file_offset >= block_end) {
+            break;
+        }
+
+        const size_t src_offset = static_cast<size_t>(allocation_file_offset - block_file_offset);
+        const size_t copy_bytes = static_cast<size_t>(std::min<uint64_t>(
+            block_end - allocation_file_offset,
+            metadata.size - allocation_offset
+        ));
+        add_registered_mapping_batch_copy(
+            h2d_groups,
+            mapping,
+            metadata.device,
+            static_cast<uint8_t*>(path_items[allocation_index].ptr) + allocation_offset,
+            static_cast<uint8_t*>(shared_ring_block_payload(mapping, block_index)) + src_offset,
+            copy_bytes
+        );
+
+        allocation_offset += copy_bytes;
+        if (allocation_offset == metadata.size) {
+            allocation_offset = 0;
+            ++allocation_index;
+        }
+    }
+}
+
+uint64_t consume_shared_ring_ready(
+    const SharedArtifactHostMapping& mapping,
+    std::vector<AllocationRef>& path_items,
+    size_t& allocation_index,
+    size_t& allocation_offset,
+    std::unordered_map<int, BatchMemcpyGroup>& h2d_groups,
+    std::vector<size_t>& consumed_block_indices
+) {
+    uint64_t expected_file_offset = 0;
+    SharedRingBlockHeader* block_headers = shared_ring_block_headers(mapping);
+
+    while (expected_file_offset < mapping.artifact_size) {
+        size_t block_index = SIZE_MAX;
+        for (size_t i = 0; i < mapping.block_count; ++i) {
+            const SharedRingBlockHeader& block = block_headers[i];
+            if (atomic_load_u32(&block.state) == static_cast<uint32_t>(SharedRingBlockState::READY) &&
+                atomic_load_u64(&block.file_offset) == expected_file_offset) {
+                block_index = i;
+                break;
+            }
+        }
+        if (block_index == SIZE_MAX) {
+            break;
+        }
+
+        atomic_store_u32(&block_headers[block_index].state, static_cast<uint32_t>(SharedRingBlockState::READING));
+        collect_shared_ring_block_copies(mapping, block_index, path_items, allocation_index, allocation_offset, h2d_groups);
+        consumed_block_indices.push_back(block_index);
+        expected_file_offset += atomic_load_u64(&block_headers[block_index].valid_bytes);
+    }
+
+    return expected_file_offset;
+}
+
+void release_shared_ring_blocks(const SharedArtifactHostMapping& mapping, const std::vector<size_t>& consumed_block_indices) {
+    SharedRingBlockHeader* block_headers = shared_ring_block_headers(mapping);
+    for (size_t block_index : consumed_block_indices) {
+        SharedRingBlockHeader& block = block_headers[block_index];
+        atomic_store_u64(&block.valid_bytes, 0);
+        atomic_store_u32(&block.state, static_cast<uint32_t>(SharedRingBlockState::FREE));
+    }
+}
+
+void consume_shared_ring_remaining(
+    const SharedArtifactHostMapping& mapping,
+    std::vector<AllocationRef>& path_items,
+    size_t& allocation_index,
+    size_t& allocation_offset,
+    uint64_t expected_file_offset
+) {
+    SharedRingGlobalHeader* header = shared_ring_global_header(mapping);
+    SharedRingBlockHeader* block_headers = shared_ring_block_headers(mapping);
+    while (expected_file_offset < mapping.artifact_size) {
+        size_t block_index = SIZE_MAX;
+        while (block_index == SIZE_MAX) {
+            for (size_t i = 0; i < mapping.block_count; ++i) {
+                const SharedRingBlockHeader& block = block_headers[i];
+                if (atomic_load_u32(&block.state) == static_cast<uint32_t>(SharedRingBlockState::READY) &&
+                    atomic_load_u64(&block.file_offset) == expected_file_offset) {
+                    block_index = i;
+                    break;
+                }
+            }
+            if (block_index != SIZE_MAX) {
+                break;
+            }
+            SIMPLE_CHECK(atomic_load_u32(&header->error_code) != kSharedRingErrorGeneric, "Shared ring producer reported an error");
+            if (atomic_load_u32(&header->producer_done) == 1 && block_index == SIZE_MAX) {
+                SIMPLE_CHECK(false, "Shared ring producer completed without providing the expected block");
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+
+        atomic_store_u32(&block_headers[block_index].state, static_cast<uint32_t>(SharedRingBlockState::READING));
+        std::unordered_map<int, BatchMemcpyGroup> h2d_groups;
+        collect_shared_ring_block_copies(mapping, block_index, path_items, allocation_index, allocation_offset, h2d_groups);
+        run_batch_memcpy(h2d_groups, cudaMemcpyHostToDevice, false);
+        expected_file_offset += atomic_load_u64(&block_headers[block_index].valid_bytes);
+        atomic_store_u64(&block_headers[block_index].valid_bytes, 0);
+        atomic_store_u32(&block_headers[block_index].state, static_cast<uint32_t>(SharedRingBlockState::FREE));
     }
 }
 
@@ -493,6 +1089,7 @@ cudaError_t TorchMemorySaver::free(void *ptr) {
 #else
     AllocationMetadata metadata;
     std::shared_ptr<DiskPrefetchState> prefetch_state_to_destroy = nullptr;
+    std::optional<SharedArtifactHostMapping> shared_mapping_to_destroy;
     {
         const std::lock_guard<std::mutex> lock(allocator_metadata_mutex_);
         if (allocation_metadata_.count(ptr) == 0) {
@@ -512,11 +1109,19 @@ cudaError_t TorchMemorySaver::free(void *ptr) {
             }
             if (release_disk_state) {
                 prefetch_state_to_destroy = DiskOffload::pop_prefetch_state(disk_prefetch_states_, metadata.disk_backup_path);
+                auto shared_it = shared_artifact_mappings_.find(metadata.disk_backup_path);
+                if (shared_it != shared_artifact_mappings_.end()) {
+                    shared_mapping_to_destroy = std::move(shared_it->second);
+                    shared_artifact_mappings_.erase(shared_it);
+                }
             }
         }
     }
 
     DiskOffload::destroy_prefetch_state(prefetch_state_to_destroy);
+    if (shared_mapping_to_destroy.has_value()) {
+        destroy_shared_artifact_mapping(*shared_mapping_to_destroy);
+    }
 
     CUDA_ERROR_CHECK(cudaDeviceSynchronize());
 
@@ -551,6 +1156,7 @@ void TorchMemorySaver::pause(const std::string& tag) {
     std::unordered_map<std::string, std::vector<AllocationRef>> disk_items_by_path;
     std::unordered_map<std::string, bool> disk_path_needs_materialize;
     std::vector<std::shared_ptr<DiskPrefetchState>> prefetch_states_to_destroy;
+    std::vector<SharedArtifactHostMapping> shared_mappings_to_destroy;
 
     {
         const std::lock_guard<std::mutex> lock(allocator_metadata_mutex_);
@@ -598,6 +1204,18 @@ void TorchMemorySaver::pause(const std::string& tag) {
 
         run_batch_memcpy(d2h_groups, cudaMemcpyDeviceToHost);
 
+        for (const auto& entry : disk_items_by_path) {
+            auto state = DiskOffload::pop_prefetch_state(disk_prefetch_states_, entry.first);
+            if (state != nullptr) {
+                prefetch_states_to_destroy.push_back(state);
+            }
+            auto shared_it = shared_artifact_mappings_.find(entry.first);
+            if (shared_it != shared_artifact_mappings_.end()) {
+                shared_mappings_to_destroy.push_back(std::move(shared_it->second));
+                shared_artifact_mappings_.erase(shared_it);
+            }
+        }
+
         for (auto& entry : disk_items_by_path) {
             if (!disk_path_needs_materialize[entry.first]) {
                 continue;
@@ -629,16 +1247,13 @@ void TorchMemorySaver::pause(const std::string& tag) {
 #endif
         }
 
-        for (const auto& entry : disk_items_by_path) {
-            auto state = DiskOffload::pop_prefetch_state(disk_prefetch_states_, entry.first);
-            if (state != nullptr) {
-                prefetch_states_to_destroy.push_back(state);
-            }
-        }
     }
 
     for (const auto& state : prefetch_states_to_destroy) {
         DiskOffload::destroy_prefetch_state(state);
+    }
+    for (auto& mapping : shared_mappings_to_destroy) {
+        destroy_shared_artifact_mapping(mapping);
     }
 #endif
 }
@@ -650,9 +1265,12 @@ void TorchMemorySaver::resume(const std::string& tag) {
 #else
     std::vector<AllocationRef> matching_items;
     std::unordered_map<std::string, std::vector<AllocationRef>> disk_items_by_path;
+    std::unordered_map<std::string, std::vector<AllocationRef>> shared_items_by_path;
     std::unordered_map<std::string, std::shared_ptr<DiskPrefetchState>> disk_prefetch_states_for_resume;
     std::unordered_map<int, BatchMemcpyGroup> h2d_groups;
     std::vector<std::shared_ptr<DiskPrefetchState>> states_to_destroy;
+    std::vector<std::string> shared_paths_to_release;
+    std::vector<SharedArtifactHostMapping> shared_mappings_to_destroy;
     AsyncMemcpyContext async_memcpy_context = create_async_memcpy_context();
 
     {
@@ -681,9 +1299,15 @@ void TorchMemorySaver::resume(const std::string& tag) {
 
         for (auto& entry : disk_items_by_path) {
             const std::string& path = entry.first;
+            const uint64_t total_artifact_bytes = DiskOffload::total_size(entry.second);
+            if (ensure_shared_artifact_mapping(shared_artifact_mappings_, path, total_artifact_bytes)) {
+                shared_items_by_path.emplace(path, entry.second);
+                continue;
+            }
+
             auto state_it = disk_prefetch_states_.find(path);
             if (state_it == disk_prefetch_states_.end()) {
-                state_it = disk_prefetch_states_.emplace(path, DiskOffload::create_prefetch_state(path, DiskOffload::total_size(entry.second))).first;
+                state_it = disk_prefetch_states_.emplace(path, DiskOffload::create_prefetch_state(path, total_artifact_bytes)).first;
             }
             disk_prefetch_states_for_resume.emplace(path, state_it->second);
         }
@@ -712,8 +1336,40 @@ void TorchMemorySaver::resume(const std::string& tag) {
         metadata.allocHandle = newAllocHandle;
     }
 
-    // Phase 1: enqueue RAM-backed restores and drain any READY disk prefetch slots
-    // without blocking on completion. Ring slots are recycled by event queries.
+    struct SharedResumeState {
+        SharedArtifactHostMapping* mapping;
+        std::vector<AllocationRef>* items;
+        size_t allocation_index = 0;
+        size_t allocation_offset = 0;
+        uint64_t resume_offset = 0;
+        std::vector<size_t> consumed_block_indices;
+    };
+    std::vector<SharedResumeState> shared_resume_states;
+    shared_resume_states.reserve(shared_items_by_path.size());
+    for (auto& entry : shared_items_by_path) {
+        auto mapping_it = shared_artifact_mappings_.find(entry.first);
+        SIMPLE_CHECK(mapping_it != shared_artifact_mappings_.end(), "Expected shared artifact mapping for staged path");
+        shared_paths_to_release.push_back(entry.first);
+        std::sort(entry.second.begin(), entry.second.end(), [](const AllocationRef& lhs, const AllocationRef& rhs) {
+            return lhs.metadata->disk_backup_offset < rhs.metadata->disk_backup_offset;
+        });
+
+        SharedResumeState srs;
+        srs.mapping = &mapping_it->second;
+        srs.items = &entry.second;
+        srs.resume_offset = consume_shared_ring_ready(
+            *srs.mapping,
+            *srs.items,
+            srs.allocation_index,
+            srs.allocation_offset,
+            h2d_groups,
+            srs.consumed_block_indices
+        );
+        shared_resume_states.push_back(std::move(srs));
+    }
+
+    // Phase 1: drain any READY disk prefetch slots without blocking on completion.
+    // Ring slots are recycled by event queries.
     struct DiskResumeState {
         std::shared_ptr<DiskPrefetchState> prefetch_state;
         std::vector<AllocationRef>* items;
@@ -722,8 +1378,6 @@ void TorchMemorySaver::resume(const std::string& tag) {
         uint64_t resume_offset = 0;
     };
     std::vector<DiskResumeState> disk_resume_states;
-
-    enqueue_batch_memcpy_async(async_memcpy_context, h2d_groups, cudaMemcpyHostToDevice);
 
     for (auto& entry : disk_items_by_path) {
         DiskResumeState drs;
@@ -745,7 +1399,27 @@ void TorchMemorySaver::resume(const std::string& tag) {
         disk_resume_states.push_back(std::move(drs));
     }
 
-    // Phase 2: enqueue remaining disk slots as they become ready.
+    const bool allow_batched_h2d = shared_items_by_path.empty();
+    run_batch_memcpy(h2d_groups, cudaMemcpyHostToDevice, allow_batched_h2d);
+
+    for (auto& srs : shared_resume_states) {
+        if (!srs.consumed_block_indices.empty()) {
+            release_shared_ring_blocks(*srs.mapping, srs.consumed_block_indices);
+            srs.consumed_block_indices.clear();
+        }
+    }
+
+    // Phase 2: consume the shared ring and any remaining disk slots.
+    for (auto& srs : shared_resume_states) {
+        consume_shared_ring_remaining(
+            *srs.mapping,
+            *srs.items,
+            srs.allocation_index,
+            srs.allocation_offset,
+            srs.resume_offset
+        );
+    }
+
     for (auto& drs : disk_resume_states) {
         consume_disk_prefetch_remaining_async(
             async_memcpy_context,
@@ -773,12 +1447,24 @@ void TorchMemorySaver::resume(const std::string& tag) {
             }
         }
 
+        for (const std::string& path : shared_paths_to_release) {
+            auto mapping_it = shared_artifact_mappings_.find(path);
+            if (mapping_it != shared_artifact_mappings_.end()) {
+                shared_mappings_to_destroy.push_back(std::move(mapping_it->second));
+                shared_artifact_mappings_.erase(mapping_it);
+            }
+        }
+
         for (const auto& entry : disk_prefetch_states_for_resume) {
             auto state = DiskOffload::pop_prefetch_state(disk_prefetch_states_, entry.first);
             if (state != nullptr) {
                 states_to_destroy.push_back(state);
             }
         }
+    }
+
+    for (auto& mapping : shared_mappings_to_destroy) {
+        destroy_shared_artifact_mapping(mapping);
     }
 
     // Destroy prefetch states in a detached thread to avoid blocking resume

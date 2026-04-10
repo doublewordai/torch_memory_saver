@@ -1,0 +1,44 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: sglang-tms-consumer
+  namespace: inference
+spec:
+  runtimeClassName: nvidia
+  containers:
+  - name: sglang
+    image: europe-west2-docker.pkg.dev/tech-426212/scratch/sglang@sha256:bbf9c3f7fc14ad94772b82169d316f5b2b6158989106657f298550ba8eb23a80
+    imagePullPolicy: IfNotPresent
+    command:
+    - bash
+    - -lc
+    - |
+      set -euo pipefail
+      export TMS_SHM_DAEMON_SOCKET=/var/run/tms/daemon.sock
+      export TMS_SGLANG_WEIGHTS_ARTIFACT_BACKEND=disk
+      export TMS_SGLANG_WEIGHTS_ARTIFACT_PATH=/var/lib/tms-checkpoints/qwen35-27b-weights.bin
+      exec python3 -m sglang.launch_server \
+        --model-path Qwen/Qwen3.5-27B \
+        --host 0.0.0.0 \
+        --port 30000 \
+        --tp 1 \
+        --enable-memory-saver
+    resources:
+      requests:
+        nvidia.com/gpu: 1
+      limits:
+        nvidia.com/gpu: 1
+    volumeMounts:
+    - name: socket-dir
+      mountPath: /var/run/tms
+    - name: checkpoint-dir
+      mountPath: /var/lib/tms-checkpoints
+  volumes:
+  - name: socket-dir
+    hostPath:
+      path: /var/run/tms
+      type: DirectoryOrCreate
+  - name: checkpoint-dir
+    hostPath:
+      path: /var/lib/tms-checkpoints
+      type: DirectoryOrCreate

@@ -1,0 +1,70 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: tms-shm-daemon
+  namespace: inference
+spec:
+  selector:
+    matchLabels:
+      app: tms-shm-daemon
+  template:
+    metadata:
+      labels:
+        app: tms-shm-daemon
+    spec:
+      runtimeClassName: nvidia
+      hostPID: false
+      containers:
+      - name: daemon
+        image: europe-west2-docker.pkg.dev/tech-426212/scratch/torch-memory-saver-daemon@sha256:899889aec2f919d85d5779ef31aa52ca6960003a7b458e784b33704558db1365
+        imagePullPolicy: IfNotPresent
+        command:
+        - torch-memory-saver-shm-daemon
+        - --socket-path
+        - /var/run/tms/daemon.sock
+        - --hugetlb-dir
+        - /dev/hugepages
+        - --require-hugetlb
+        - --watch-dirs
+        - /var/lib/tms-checkpoints
+        - --block-bytes
+        - "1073741824"
+        - --block-count
+        - "52"
+        env:
+        - name: PYTHONDONTWRITEBYTECODE
+          value: "1"
+        - name: TMS_SHM_DAEMON_MAX_STAGED_BYTES
+          value: "68719476736"
+        - name: TMS_SHM_DAEMON_TRACE_FILE
+          value: /var/run/tms/tms-daemon.trace.json
+        ports: []
+        resources:
+          requests:
+            cpu: "1"
+            memory: "1Gi"
+            hugepages-2Mi: "64Gi"
+          limits:
+            cpu: "4"
+            memory: "4Gi"
+            hugepages-2Mi: "64Gi"
+        volumeMounts:
+        - name: socket-dir
+          mountPath: /var/run/tms
+        - name: checkpoint-dir
+          mountPath: /var/lib/tms-checkpoints
+        - name: hugepages
+          mountPath: /dev/hugepages
+      volumes:
+      - name: socket-dir
+        hostPath:
+          path: /var/run/tms
+          type: DirectoryOrCreate
+      - name: checkpoint-dir
+        hostPath:
+          path: /var/lib/tms-checkpoints
+          type: DirectoryOrCreate
+      - name: hugepages
+        hostPath:
+          path: /dev/hugepages
+          type: Directory

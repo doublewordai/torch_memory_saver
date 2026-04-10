@@ -17,6 +17,7 @@ namespace {
 
 constexpr uint64_t kInvalidDiskBackupOffset = std::numeric_limits<uint64_t>::max();
 constexpr uint64_t kDirectIoAlignmentBytes = 4096;
+constexpr const char* kArtifactCompleteSuffix = ".complete";
 
 enum class DiskReadMode {
     DIRECT,
@@ -151,6 +152,72 @@ void pread_all(int fd, void* buf, size_t size, uint64_t offset) {
     }
 }
 
+std::string artifact_completion_marker_path(const std::string& artifact_path) {
+    return artifact_path + kArtifactCompleteSuffix;
+}
+
+void remove_artifact_completion_marker(const std::string& artifact_path) {
+    const std::string marker_path = artifact_completion_marker_path(artifact_path);
+    if (unlink(marker_path.c_str()) != 0 && errno != ENOENT) {
+        std::cerr << "[torch_memory_saver.cpp] unlink completion marker failed path=" << marker_path
+                  << " errno=" << errno << " (" << std::strerror(errno) << ")"
+                  << " file=" << __FILE__ << " func=" << __func__ << " line=" << __LINE__
+                  << std::endl;
+        exit(1);
+    }
+}
+
+void publish_artifact_completion_marker(const std::string& artifact_path, uint64_t artifact_size) {
+    const std::string marker_path = artifact_completion_marker_path(artifact_path);
+    const std::string temp_path = marker_path + ".tmp";
+    const int fd = open(temp_path.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0644);
+    if (fd < 0) {
+        std::cerr << "[torch_memory_saver.cpp] open completion marker failed path=" << temp_path
+                  << " errno=" << errno << " (" << std::strerror(errno) << ")"
+                  << " file=" << __FILE__ << " func=" << __func__ << " line=" << __LINE__
+                  << std::endl;
+        exit(1);
+    }
+
+    const uint64_t generation_token = static_cast<uint64_t>(
+        std::chrono::system_clock::now().time_since_epoch().count()
+    );
+    const std::string payload = std::to_string(artifact_size) + "\t" + std::to_string(generation_token) + "\n";
+    size_t written_total = 0;
+    while (written_total < payload.size()) {
+        const ssize_t written = write(fd, payload.data() + written_total, payload.size() - written_total);
+        if (written < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            std::cerr << "[torch_memory_saver.cpp] write completion marker failed path=" << temp_path
+                      << " errno=" << errno << " (" << std::strerror(errno) << ")"
+                      << " file=" << __FILE__ << " func=" << __func__ << " line=" << __LINE__
+                      << std::endl;
+            exit(1);
+        }
+        written_total += static_cast<size_t>(written);
+    }
+
+    (void) fdatasync(fd);
+    if (close(fd) != 0) {
+        std::cerr << "[torch_memory_saver.cpp] close completion marker failed path=" << temp_path
+                  << " errno=" << errno << " (" << std::strerror(errno) << ")"
+                  << " file=" << __FILE__ << " func=" << __func__ << " line=" << __LINE__
+                  << std::endl;
+        exit(1);
+    }
+
+    if (rename(temp_path.c_str(), marker_path.c_str()) != 0) {
+        std::cerr << "[torch_memory_saver.cpp] rename completion marker failed from=" << temp_path
+                  << " to=" << marker_path
+                  << " errno=" << errno << " (" << std::strerror(errno) << ")"
+                  << " file=" << __FILE__ << " func=" << __func__ << " line=" << __LINE__
+                  << std::endl;
+        exit(1);
+    }
+}
+
 }  // namespace
 
 namespace DiskOffload {
@@ -182,6 +249,7 @@ void materialize_artifact(const std::vector<AllocationRef>& items) {
 
     const std::string& path = ordered.front().metadata->disk_backup_path;
     SIMPLE_CHECK(!path.empty(), "disk_backup_loc requires a non-empty path");
+    remove_artifact_completion_marker(path);
 
     const int fd = open(path.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0644);
     if (fd < 0) {
@@ -220,6 +288,8 @@ void materialize_artifact(const std::vector<AllocationRef>& items) {
                   << std::endl;
         exit(1);
     }
+
+    publish_artifact_completion_marker(path, offset);
 }
 
 std::shared_ptr<DiskPrefetchState> create_prefetch_state(const std::string& path, uint64_t total_size) {
