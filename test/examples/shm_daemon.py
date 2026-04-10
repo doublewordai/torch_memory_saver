@@ -1,9 +1,7 @@
-import array
 import contextlib
 import ctypes
 import os
 from pathlib import Path
-import socket
 import subprocess
 import sys
 import tempfile
@@ -40,21 +38,6 @@ def _read_captured_fd(read_fd: int) -> str:
     return b"".join(chunks).decode("utf-8", errors="replace")
 
 
-def _daemon_lookup_status(socket_path: str, artifact_path: str, expected_size: int) -> str:
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-        sock.connect(socket_path)
-        request = f"lookup\t{artifact_path}\t{expected_size}\n".encode("utf-8")
-        sock.sendall(request)
-        data, ancdata, _flags, _addr = sock.recvmsg(1024, socket.CMSG_SPACE(array.array("i", [0]).itemsize))
-        for cmsg_level, cmsg_type, cmsg_data in ancdata:
-            if cmsg_level == socket.SOL_SOCKET and cmsg_type == socket.SCM_RIGHTS:
-                fds = array.array("i")
-                fds.frombytes(cmsg_data[: len(cmsg_data) - (len(cmsg_data) % fds.itemsize)])
-                for fd in fds:
-                    os.close(fd)
-        return data.decode("utf-8").strip().split("\t", 1)[0]
-
-
 def _wait_for_socket(socket_path: str, timeout_s: float) -> None:
     deadline = time.time() + timeout_s
     while time.time() < deadline:
@@ -62,19 +45,6 @@ def _wait_for_socket(socket_path: str, timeout_s: float) -> None:
             return
         time.sleep(0.05)
     raise TimeoutError(f"daemon socket did not appear: {socket_path}")
-
-
-def _wait_for_daemon_ready(socket_path: str, artifact_path: str, expected_size: int, timeout_s: float) -> None:
-    deadline = time.time() + timeout_s
-    while time.time() < deadline:
-        try:
-            status = _daemon_lookup_status(socket_path, artifact_path, expected_size)
-        except (ConnectionRefusedError, FileNotFoundError, OSError):
-            status = "missing"
-        if status in {"ready", "streaming"}:
-            return
-        time.sleep(0.05)
-    raise TimeoutError(f"daemon did not stage artifact in time: {artifact_path}")
 
 
 def _clear_mem_pools() -> None:
@@ -116,9 +86,7 @@ def run(hook_mode: str):
             _wait_for_socket(str(socket_path), timeout_s=10.0)
 
             old_socket = os.environ.get("TMS_SHM_DAEMON_SOCKET")
-            old_wait_ms = os.environ.get("TMS_SHM_DAEMON_LOOKUP_WAIT_MS")
             os.environ["TMS_SHM_DAEMON_SOCKET"] = str(socket_path)
-            os.environ["TMS_SHM_DAEMON_LOOKUP_WAIT_MS"] = "0"
             try:
                 with torch_memory_saver.region(tag="disk_weights", disk_backup_loc=str(artifact_path)):
                     disk_tensor = torch.arange(4_000_000, dtype=torch.float32, device="cuda")
@@ -127,8 +95,6 @@ def run(hook_mode: str):
                 torch_memory_saver.pause("disk_weights")
                 assert artifact_path.exists()
                 assert Path(f"{artifact_path}.complete").exists()
-
-                _wait_for_daemon_ready(str(socket_path), str(artifact_path), artifact_path.stat().st_size, timeout_s=15.0)
 
                 with _capture_stdout_fd() as read_fd:
                     torch_memory_saver.resume("disk_weights")
@@ -143,10 +109,6 @@ def run(hook_mode: str):
                     os.environ.pop("TMS_SHM_DAEMON_SOCKET", None)
                 else:
                     os.environ["TMS_SHM_DAEMON_SOCKET"] = old_socket
-                if old_wait_ms is None:
-                    os.environ.pop("TMS_SHM_DAEMON_LOOKUP_WAIT_MS", None)
-                else:
-                    os.environ["TMS_SHM_DAEMON_LOOKUP_WAIT_MS"] = old_wait_ms
         finally:
             daemon_proc.terminate()
             try:

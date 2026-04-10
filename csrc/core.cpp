@@ -22,7 +22,6 @@
 namespace {
 
 constexpr const char* kShmDaemonSocketEnv = "TMS_SHM_DAEMON_SOCKET";
-constexpr const char* kShmLookupWaitMsEnv = "TMS_SHM_DAEMON_LOOKUP_WAIT_MS";
 constexpr const char* kArtifactCompleteSuffix = ".complete";
 constexpr size_t kCudaHostRegisterChunkBytes = 1ull << 30;
 constexpr size_t kSharedArtifactCopyChunkBytes = 128ull * 1024ull * 1024ull;
@@ -74,11 +73,6 @@ std::string get_shm_daemon_socket_path() {
 
 std::string artifact_completion_marker_path(const std::string& artifact_path) {
     return artifact_path + kArtifactCompleteSuffix;
-}
-
-bool artifact_completion_marker_exists(const std::string& artifact_path) {
-    struct stat st {};
-    return stat(artifact_completion_marker_path(artifact_path).c_str(), &st) == 0;
 }
 
 std::vector<std::string> split_tab_fields(const std::string& line) {
@@ -316,24 +310,15 @@ std::optional<StagedArtifactInfo> lookup_staged_artifact(
     const std::string& artifact_path,
     uint64_t artifact_size
 ) {
-    const uint64_t wait_ms = artifact_completion_marker_exists(artifact_path)
-        ? get_uint64_env_var(kShmLookupWaitMsEnv, 30000)
-        : 0;
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(wait_ms);
-    while (true) {
-        const std::string expected_token = read_artifact_completion_token(artifact_path);
-        std::optional<StagedArtifactInfo> staged = lookup_staged_artifact_once(artifact_path, artifact_size);
-        if (staged.has_value() && (expected_token.empty() || staged->completion_token == expected_token)) {
-            return staged;
-        }
-        if (staged.has_value() && staged->shm_fd >= 0) {
-            (void) close(staged->shm_fd);
-        }
-        if (wait_ms == 0 || std::chrono::steady_clock::now() >= deadline) {
-            return std::nullopt;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    const std::string expected_token = read_artifact_completion_token(artifact_path);
+    std::optional<StagedArtifactInfo> staged = lookup_staged_artifact_once(artifact_path, artifact_size);
+    if (staged.has_value() && (expected_token.empty() || staged->completion_token == expected_token)) {
+        return staged;
     }
+    if (staged.has_value() && staged->shm_fd >= 0) {
+        (void) close(staged->shm_fd);
+    }
+    return std::nullopt;
 }
 
 void destroy_shared_artifact_mapping(SharedArtifactHostMapping& mapping) {

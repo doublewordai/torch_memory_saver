@@ -385,6 +385,18 @@ class StageManager:
                 raise
             return self._allocate_memfd(entry)
 
+    def _ensure_entry_backing_locked(self, entry: Entry) -> None:
+        if entry.shm_map is not None and entry.shm_fd >= 0 and entry.host_address != 0:
+            self._initialize_ring(entry)
+            return
+        shm_fd, shm_map, host_address, backing_kind, backing_path = self._allocate_backing(entry)
+        entry.shm_fd = shm_fd
+        entry.shm_map = shm_map
+        entry.host_address = host_address
+        entry.backing_kind = backing_kind
+        entry.backing_path = backing_path
+        self._initialize_ring(entry)
+
     def _global_pack(self, entry: Entry, producer_done: int, consumer_state: int, error_code: int) -> bytes:
         return struct.pack(
             K_GLOBAL_FORMAT,
@@ -483,7 +495,8 @@ class StageManager:
         if existing is not None and existing.completion_token == marker.token and existing.artifact_size == stat_result.st_size:
             existing.last_access_ns = monotonic_ns()
             if self._entry_needs_restage(existing):
-                existing.state = "loading"
+                self._ensure_entry_backing_locked(existing)
+                existing.state = "streaming"
                 existing.error = None
                 existing.producer_done = False
                 existing.consumer_attached = False
@@ -499,7 +512,8 @@ class StageManager:
             if existing.shm_map is not None and existing.shm_fd >= 0 and existing.host_address != 0:
                 existing.artifact_size = stat_result.st_size
                 existing.completion_token = marker.token
-                existing.state = "loading"
+                self._ensure_entry_backing_locked(existing)
+                existing.state = "streaming"
                 existing.error = None
                 existing.producer_done = False
                 existing.consumer_attached = False
@@ -523,6 +537,8 @@ class StageManager:
             staging=True,
         )
         self._evict_if_needed(entry.mapped_size)
+        self._ensure_entry_backing_locked(entry)
+        entry.state = "streaming"
         self.entries[signature] = entry
         thread = threading.Thread(target=self._stage_entry, args=(entry,), daemon=True)
         thread.start()
@@ -617,7 +633,7 @@ class StageManager:
             with TraceScope(self.trace, "daemon", "stage_entry", artifact_path=entry.artifact_path, artifact_size=entry.artifact_size, block_payload_bytes=entry.block_payload_bytes, block_count=entry.block_count):
                 file_fd = os.open(entry.artifact_path, os.O_RDONLY | os.O_DIRECT)
                 try:
-                    if not reuse_existing:
+                    if entry.shm_map is None or entry.shm_fd < 0 or entry.host_address == 0:
                         phase = "allocate_backing"
                         shm_fd, shm_map, host_address, backing_kind, backing_path = self._allocate_backing(entry)
                         entry.shm_fd = shm_fd
@@ -732,9 +748,6 @@ class Handler(socketserver.StreamRequestHandler):
                 return
             if entry.state == "error":
                 self._send_response(f"error\t{entry.error}\n")
-                return
-            if entry.state == "streaming" and entry.artifact_size <= entry.block_count * entry.block_payload_bytes:
-                self._send_response("loading\n")
                 return
             if entry.shm_fd < 0:
                 self._send_response("loading\n")

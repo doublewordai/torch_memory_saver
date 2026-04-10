@@ -112,7 +112,7 @@ There is now a daemonized fast path for disk backups:
 - the daemon reads backup data into that ring with `O_DIRECT`
 - each ring block has in-band state and offset metadata
 - on `resume()`, TMS first asks the daemon whether a staged ring exists for the backup file
-- if it does, the daemon passes the backing FD over the Unix socket, the current process `mmap()`s it, `cudaHostRegister()`s it in-process, and restores from the shared ring
+- if it does, the daemon passes the backing FD over the Unix socket immediately, the current process `mmap()`s it, `cudaHostRegister()`s it in-process, and restores from the shared ring while the daemon continues staging later blocks
 - if no staged ring is ready, `resume()` falls back to the existing direct disk prefetch path
 
 Daemon entry point:
