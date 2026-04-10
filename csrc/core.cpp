@@ -9,6 +9,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <fstream>
+#include <numeric>
 #include <optional>
 #include <sstream>
 #include <sys/mman.h>
@@ -73,6 +74,13 @@ std::string get_shm_daemon_socket_path() {
 
 std::string artifact_completion_marker_path(const std::string& artifact_path) {
     return artifact_path + kArtifactCompleteSuffix;
+}
+
+double duration_ms(
+    const std::chrono::steady_clock::time_point& start,
+    const std::chrono::steady_clock::time_point& end
+) {
+    return std::chrono::duration<double, std::milli>(end - start).count();
 }
 
 std::vector<std::string> split_tab_fields(const std::string& line) {
@@ -354,7 +362,9 @@ bool ensure_shared_artifact_mapping(
     const std::string& artifact_path,
     uint64_t artifact_size
 ) {
+    const auto lookup_start = std::chrono::steady_clock::now();
     const std::optional<StagedArtifactInfo> staged = lookup_staged_artifact(artifact_path, artifact_size);
+    const auto lookup_end = std::chrono::steady_clock::now();
     if (!staged.has_value()) {
         return false;
     }
@@ -382,7 +392,9 @@ bool ensure_shared_artifact_mapping(
         return false;
     }
 
+    const auto mmap_start = std::chrono::steady_clock::now();
     void* mapping_base = mmap(nullptr, staged->mapped_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+    const auto mmap_end = std::chrono::steady_clock::now();
     if (mapping_base == MAP_FAILED) {
         (void) close(shm_fd);
         shared_artifact_mappings.erase(artifact_path);
@@ -401,12 +413,14 @@ bool ensure_shared_artifact_mapping(
         return false;
     }
 
+    const auto register_start = std::chrono::steady_clock::now();
     if (!cuda_host_register_chunked(mapping_base, staged->mapped_size, cudaHostRegisterPortable)) {
         (void) munmap(mapping_base, staged->mapped_size);
         (void) close(shm_fd);
         shared_artifact_mappings.erase(artifact_path);
         return false;
     }
+    const auto register_end = std::chrono::steady_clock::now();
 
     mapping.shm_name = staged->shm_name;
     mapping.completion_token = staged->completion_token;
@@ -428,6 +442,9 @@ bool ensure_shared_artifact_mapping(
               << " mapped_bytes=" << mapping.mapped_size
               << " block_bytes=" << mapping.block_payload_bytes
               << " block_count=" << mapping.block_count
+              << " lookup_ms=" << duration_ms(lookup_start, lookup_end)
+              << " mmap_ms=" << duration_ms(mmap_start, mmap_end)
+              << " cuda_host_register_ms=" << duration_ms(register_start, register_end)
               << std::endl;
     return true;
 }
@@ -442,6 +459,22 @@ struct AsyncMemcpyContext {
     int original_device = 0;
     std::unordered_map<int, cudaStream_t> streams_by_device;
 };
+
+size_t total_group_bytes(const std::unordered_map<int, BatchMemcpyGroup>& groups) {
+    size_t total_bytes = 0;
+    for (const auto& entry : groups) {
+        total_bytes += std::accumulate(entry.second.sizes.begin(), entry.second.sizes.end(), static_cast<size_t>(0));
+    }
+    return total_bytes;
+}
+
+size_t total_group_copies(const std::unordered_map<int, BatchMemcpyGroup>& groups) {
+    size_t total_copies = 0;
+    for (const auto& entry : groups) {
+        total_copies += entry.second.sizes.size();
+    }
+    return total_copies;
+}
 
 void add_batch_copy(
     std::unordered_map<int, BatchMemcpyGroup>& groups,
@@ -624,11 +657,16 @@ void record_disk_prefetch_slot_events(
 void run_batch_memcpy(
     std::unordered_map<int, BatchMemcpyGroup>& groups,
     cudaMemcpyKind fallback_kind,
-    bool allow_batch = true
+    bool allow_batch = true,
+    const char* phase_label = "unspecified"
 ) {
     if (groups.empty()) {
         return;
     }
+
+    const size_t copy_count = total_group_copies(groups);
+    const size_t total_bytes = total_group_bytes(groups);
+    const auto start = std::chrono::steady_clock::now();
 
     int original_device = 0;
     CUDA_ERROR_CHECK(cudaGetDevice(&original_device));
@@ -713,6 +751,20 @@ void run_batch_memcpy(
     }
 
     CUDA_ERROR_CHECK(cudaSetDevice(original_device));
+    const auto end = std::chrono::steady_clock::now();
+    const double elapsed_ms = duration_ms(start, end);
+    const double gib_per_s = elapsed_ms > 0.0
+        ? (static_cast<double>(total_bytes) / (1024.0 * 1024.0 * 1024.0)) / (elapsed_ms / 1000.0)
+        : 0.0;
+    std::cout << "[torch_memory_saver.cpp] batch memcpy complete"
+              << " phase=" << phase_label
+              << " allow_batch=" << (allow_batch ? "true" : "false")
+              << " devices=" << streams_by_device.size()
+              << " copies=" << copy_count
+              << " bytes=" << total_bytes
+              << " elapsed_ms=" << elapsed_ms
+              << " gib_per_s=" << gib_per_s
+              << std::endl;
 }
 
 // Collect H2D copy entries from a single slot into an existing batch group.
@@ -806,8 +858,10 @@ uint64_t consume_shared_ring_ready(
     std::unordered_map<int, BatchMemcpyGroup>& h2d_groups,
     std::vector<size_t>& consumed_block_indices
 ) {
+    const auto start = std::chrono::steady_clock::now();
     uint64_t expected_file_offset = 0;
     SharedRingBlockHeader* block_headers = shared_ring_block_headers(mapping);
+    size_t ready_block_count = 0;
 
     while (expected_file_offset < mapping.artifact_size) {
         size_t block_index = SIZE_MAX;
@@ -826,8 +880,17 @@ uint64_t consume_shared_ring_ready(
         atomic_store_u32(&block_headers[block_index].state, static_cast<uint32_t>(SharedRingBlockState::READING));
         collect_shared_ring_block_copies(mapping, block_index, path_items, allocation_index, allocation_offset, h2d_groups);
         consumed_block_indices.push_back(block_index);
+        ready_block_count += 1;
         expected_file_offset += atomic_load_u64(&block_headers[block_index].valid_bytes);
     }
+
+    const auto end = std::chrono::steady_clock::now();
+    std::cout << "[torch_memory_saver.cpp] shared ring ready drain"
+              << " artifact_bytes=" << mapping.artifact_size
+              << " ready_blocks=" << ready_block_count
+              << " ready_bytes=" << expected_file_offset
+              << " elapsed_ms=" << duration_ms(start, end)
+              << std::endl;
 
     return expected_file_offset;
 }
@@ -848,8 +911,11 @@ void consume_shared_ring_remaining(
     size_t& allocation_offset,
     uint64_t expected_file_offset
 ) {
+    const auto start = std::chrono::steady_clock::now();
     SharedRingGlobalHeader* header = shared_ring_global_header(mapping);
     SharedRingBlockHeader* block_headers = shared_ring_block_headers(mapping);
+    size_t remaining_block_count = 0;
+    uint64_t resumed_bytes = 0;
     while (expected_file_offset < mapping.artifact_size) {
         size_t block_index = SIZE_MAX;
         while (block_index == SIZE_MAX) {
@@ -874,11 +940,21 @@ void consume_shared_ring_remaining(
         atomic_store_u32(&block_headers[block_index].state, static_cast<uint32_t>(SharedRingBlockState::READING));
         std::unordered_map<int, BatchMemcpyGroup> h2d_groups;
         collect_shared_ring_block_copies(mapping, block_index, path_items, allocation_index, allocation_offset, h2d_groups);
-        run_batch_memcpy(h2d_groups, cudaMemcpyHostToDevice, false);
-        expected_file_offset += atomic_load_u64(&block_headers[block_index].valid_bytes);
+        run_batch_memcpy(h2d_groups, cudaMemcpyHostToDevice, true, "shared_remaining");
+        const uint64_t block_bytes = atomic_load_u64(&block_headers[block_index].valid_bytes);
+        expected_file_offset += block_bytes;
+        resumed_bytes += block_bytes;
+        remaining_block_count += 1;
         atomic_store_u64(&block_headers[block_index].valid_bytes, 0);
         atomic_store_u32(&block_headers[block_index].state, static_cast<uint32_t>(SharedRingBlockState::FREE));
     }
+    const auto end = std::chrono::steady_clock::now();
+    std::cout << "[torch_memory_saver.cpp] shared ring remaining drain"
+              << " artifact_bytes=" << mapping.artifact_size
+              << " resumed_bytes=" << resumed_bytes
+              << " blocks=" << remaining_block_count
+              << " elapsed_ms=" << duration_ms(start, end)
+              << std::endl;
 }
 
 size_t find_ready_slot_locked(
@@ -1187,7 +1263,7 @@ void TorchMemorySaver::pause(const std::string& tag) {
             }
         }
 
-        run_batch_memcpy(d2h_groups, cudaMemcpyDeviceToHost);
+        run_batch_memcpy(d2h_groups, cudaMemcpyDeviceToHost, true, "pause_disk_offload");
 
         for (const auto& entry : disk_items_by_path) {
             auto state = DiskOffload::pop_prefetch_state(disk_prefetch_states_, entry.first);
@@ -1307,6 +1383,9 @@ void TorchMemorySaver::resume(const std::string& tag) {
         DiskOffload::start_prefetch_if_needed(entry.second);
     }
 
+    const auto remap_start = std::chrono::steady_clock::now();
+    size_t remap_allocation_count = 0;
+    size_t remap_allocation_bytes = 0;
     for (const AllocationRef& item : matching_items) {
         void *ptr = item.ptr;
         AllocationMetadata &metadata = *item.metadata;
@@ -1324,7 +1403,15 @@ void TorchMemorySaver::resume(const std::string& tag) {
 
         metadata.state = AllocationState::ACTIVE;
         metadata.allocHandle = newAllocHandle;
+        remap_allocation_count += 1;
+        remap_allocation_bytes += metadata.size;
     }
+    const auto remap_end = std::chrono::steady_clock::now();
+    std::cout << "[torch_memory_saver.cpp] resume remap complete"
+              << " allocations=" << remap_allocation_count
+              << " bytes=" << remap_allocation_bytes
+              << " elapsed_ms=" << duration_ms(remap_start, remap_end)
+              << std::endl;
 
     struct SharedResumeState {
         SharedArtifactHostMapping* mapping;
@@ -1389,8 +1476,8 @@ void TorchMemorySaver::resume(const std::string& tag) {
         disk_resume_states.push_back(std::move(drs));
     }
 
-    const bool allow_batched_h2d = shared_items_by_path.empty();
-    run_batch_memcpy(h2d_groups, cudaMemcpyHostToDevice, allow_batched_h2d);
+    const bool allow_batched_h2d = true;
+    run_batch_memcpy(h2d_groups, cudaMemcpyHostToDevice, allow_batched_h2d, "resume_initial_h2d");
 
     for (auto& srs : shared_resume_states) {
         if (!srs.consumed_block_indices.empty()) {
