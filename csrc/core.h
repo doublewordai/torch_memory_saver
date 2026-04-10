@@ -4,8 +4,11 @@
 #include <unordered_map>
 #include <atomic>
 #include <mutex>
+#include <memory>
 #include <string>
+#include <thread>
 #include <vector>
+#include <condition_variable>
 #include "utils.h"
 #include "macro.h"
 
@@ -20,6 +23,8 @@ enum class AllocationState {
     PAUSED
 };
 
+struct DiskPrefetchState;
+
 struct AllocationMetadata {
     size_t size;
     CUdevice device;
@@ -27,6 +32,8 @@ struct AllocationMetadata {
     AllocationState state;
     bool enable_cpu_backup;
     void* cpu_backup;
+    std::string disk_backup_path;
+    uint64_t disk_backup_offset;
 
 #if TMS_ROCM_LEGACY_CHUNKED
     // ROCm 6.x: Chunked allocation workaround
@@ -43,7 +50,14 @@ class TorchMemorySaver {
 public:
     static TorchMemorySaver& instance();
 
-    cudaError_t malloc(void** ptr, CUdevice device, size_t size, const std::string& tag, bool enable_cpu_backup);
+    cudaError_t malloc(
+        void** ptr,
+        CUdevice device,
+        size_t size,
+        const std::string& tag,
+        bool enable_cpu_backup,
+        const std::string& disk_backup_path
+    );
     cudaError_t free(void *ptr);
 
     void pause(const std::string& tag);
@@ -61,5 +75,6 @@ private:
 
     std::mutex allocator_metadata_mutex_;
     std::unordered_map<void*, AllocationMetadata> allocation_metadata_;
+    std::unordered_map<std::string, std::shared_ptr<DiskPrefetchState>> disk_prefetch_states_;
     std::atomic<uint64_t> memory_margin_bytes_ = 0;
 };

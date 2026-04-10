@@ -32,9 +32,21 @@ public:
         enable_cpu_backup_ = value;
     }
 
+    const std::string& disk_backup_path() {
+        if (!disk_backup_path_.has_value()) {
+            disk_backup_path_ = get_string_env_var("TMS_INIT_DISK_BACKUP_PATH");
+        }
+        return disk_backup_path_.value();
+    }
+
+    void set_disk_backup_path(const std::string& value) {
+        disk_backup_path_ = value;
+    }
+
 private:
     std::optional<bool> is_interesting_region_;
     std::optional<bool> enable_cpu_backup_;
+    std::optional<std::string> disk_backup_path_;
 };
 static thread_local ThreadLocalConfig thread_local_config;
 
@@ -44,7 +56,12 @@ static thread_local ThreadLocalConfig thread_local_config;
 cudaError_t cudaMalloc(void **ptr, size_t size) {
     if (thread_local_config.is_interesting_region()) {
         return TorchMemorySaver::instance().malloc(
-            ptr, CUDAUtils::cu_ctx_get_device(), size, thread_local_config.current_tag_, thread_local_config.enable_cpu_backup());
+            ptr,
+            CUDAUtils::cu_ctx_get_device(),
+            size,
+            thread_local_config.current_tag_,
+            thread_local_config.enable_cpu_backup(),
+            thread_local_config.disk_backup_path());
     } else {
         return APIForwarder::call_real_cuda_malloc(ptr, size);
     }
@@ -66,7 +83,12 @@ void *tms_torch_malloc(ssize_t size, int device, cudaStream_t stream) {
     SIMPLE_CHECK(thread_local_config.is_interesting_region(), "only support interesting region");
     void *ptr;
     CUDA_ERROR_CHECK(TorchMemorySaver::instance().malloc(
-        &ptr, CUDAUtils::cu_device_get(device), size, thread_local_config.current_tag_, thread_local_config.enable_cpu_backup()));
+        &ptr,
+        CUDAUtils::cu_device_get(device),
+        size,
+        thread_local_config.current_tag_,
+        thread_local_config.enable_cpu_backup(),
+        thread_local_config.disk_backup_path()));
     return ptr;
 }
 
@@ -108,6 +130,14 @@ bool tms_get_enable_cpu_backup() {
 
 void tms_set_enable_cpu_backup(bool enable_cpu_backup) {
     thread_local_config.set_enable_cpu_backup(enable_cpu_backup);
+}
+
+const char* tms_get_disk_backup_path() {
+    return thread_local_config.disk_backup_path().c_str();
+}
+
+void tms_set_disk_backup_path(const char* disk_backup_path) {
+    thread_local_config.set_disk_backup_path((disk_backup_path != nullptr) ? std::string(disk_backup_path) : std::string());
 }
 
 void set_memory_margin_bytes(uint64_t value) {
