@@ -1297,11 +1297,13 @@ void TorchMemorySaver::resume(const std::string& tag) {
             }
         }
 
+        std::vector<std::string> shared_backed_paths;
         for (auto& entry : disk_items_by_path) {
             const std::string& path = entry.first;
             const uint64_t total_artifact_bytes = DiskOffload::total_size(entry.second);
             if (ensure_shared_artifact_mapping(shared_artifact_mappings_, path, total_artifact_bytes)) {
                 shared_items_by_path.emplace(path, entry.second);
+                shared_backed_paths.push_back(path);
                 continue;
             }
 
@@ -1310,6 +1312,9 @@ void TorchMemorySaver::resume(const std::string& tag) {
                 state_it = disk_prefetch_states_.emplace(path, DiskOffload::create_prefetch_state(path, total_artifact_bytes)).first;
             }
             disk_prefetch_states_for_resume.emplace(path, state_it->second);
+        }
+        for (const std::string& path : shared_backed_paths) {
+            disk_items_by_path.erase(path);
         }
     }
 
