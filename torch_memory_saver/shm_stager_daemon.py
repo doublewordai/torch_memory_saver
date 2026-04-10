@@ -28,7 +28,6 @@ K_DEFAULT_MAX_STAGED_BYTES = 0
 K_ARTIFACT_COMPLETE_SUFFIX = ".complete"
 K_DIRECT_IO_ALIGNMENT = 4096
 K_HUGEPAGE_ALIGNMENT = 2 * 1024 * 1024
-K_CUDA_REGISTER_CHUNK_BYTES = 1 << 30
 K_RING_MAGIC = b"TMSRING\0"
 K_RING_VERSION = 1
 K_BLOCK_STATE_FREE = 0
@@ -170,69 +169,6 @@ class Libc:
             current_offset += read_bytes
 
 
-class CudaRuntime:
-    def __init__(self) -> None:
-        last_error: Optional[Exception] = None
-        for name in ("libcudart.so", "libcudart.so.12", "libcudart.so.11.0"):
-            try:
-                self.lib = ctypes.CDLL(name)
-                break
-            except OSError as exc:
-                last_error = exc
-        else:
-            raise RuntimeError(f"failed to load libcudart: {last_error}")
-
-        self.lib.cudaHostRegister.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint]
-        self.lib.cudaHostRegister.restype = ctypes.c_int
-        self.lib.cudaHostUnregister.argtypes = [ctypes.c_void_p]
-        self.lib.cudaHostUnregister.restype = ctypes.c_int
-        self.lib.cudaGetErrorString.argtypes = [ctypes.c_int]
-        self.lib.cudaGetErrorString.restype = ctypes.c_char_p
-
-    def _check(self, code: int, op: str) -> None:
-        if code == 0:
-            return
-        message = self.lib.cudaGetErrorString(code)
-        detail = message.decode("utf-8") if message else f"cuda error {code}"
-        raise RuntimeError(f"{op} failed: {detail}")
-
-    def host_register(self, address: int, size: int) -> None:
-        self._check(self.lib.cudaHostRegister(ctypes.c_void_p(address), size, 0), "cudaHostRegister")
-
-    def host_unregister(self, address: int) -> None:
-        self._check(self.lib.cudaHostUnregister(ctypes.c_void_p(address)), "cudaHostUnregister")
-
-
-def cuda_host_register_chunked(cuda: CudaRuntime, address: int, size: int) -> None:
-    registered = []
-    cursor = address
-    remaining = size
-    try:
-        while remaining > 0:
-            chunk = min(remaining, K_CUDA_REGISTER_CHUNK_BYTES)
-            cuda.host_register(cursor, chunk)
-            registered.append(cursor)
-            cursor += chunk
-            remaining -= chunk
-    except Exception:
-        for registered_address in registered:
-            try:
-                cuda.host_unregister(registered_address)
-            except Exception:
-                pass
-        raise
-
-
-def cuda_host_unregister_chunked(cuda: CudaRuntime, address: int, size: int) -> None:
-    cursor = address
-    remaining = size
-    while remaining > 0:
-        chunk = min(remaining, K_CUDA_REGISTER_CHUNK_BYTES)
-        cuda.host_unregister(cursor)
-        cursor += chunk
-        remaining -= chunk
-
-
 @dataclass
 class Entry:
     artifact_path: str
@@ -248,7 +184,6 @@ class Entry:
     shm_fd: int = -1
     shm_map: Optional[mmap.mmap] = None
     host_address: int = 0
-    cuda_registered: bool = False
     backing_kind: str = "memfd"
     backing_path: Optional[str] = None
     next_read_offset: int = 0
@@ -258,10 +193,7 @@ class Entry:
     completion_token: str = ""
     staging: bool = False
 
-    def close(self, cuda_runtime: CudaRuntime) -> None:
-        if self.cuda_registered and self.host_address:
-            cuda_host_unregister_chunked(cuda_runtime, self.host_address, self.mapped_size)
-            self.cuda_registered = False
+    def close(self) -> None:
         if self.shm_map is not None:
             self.shm_map.close()
             self.shm_map = None
@@ -298,7 +230,6 @@ class StageManager:
     ) -> None:
         self.layout = SharedRingLayout(block_bytes, block_count)
         self.libc = Libc()
-        self.cuda = CudaRuntime()
         self.lock = threading.Lock()
         self.entries: dict[str, Entry] = {}
         self.trace = TraceWriter(trace_file)
@@ -321,7 +252,7 @@ class StageManager:
             entries = list(self.entries.values())
             self.entries.clear()
         for entry in entries:
-            entry.close(self.cuda)
+            entry.close()
         self.trace.close()
 
     def _entry_mapped_bytes(self, entry: Entry) -> int:
@@ -345,7 +276,7 @@ class StageManager:
                 raise RuntimeError("hugepage staging budget exhausted")
             victim = min(candidates, key=lambda entry: entry.last_access_ns)
             self.entries.pop(victim.signature, None)
-            victim.close(self.cuda)
+            victim.close()
 
     def _allocate_memfd(self, entry: Entry) -> tuple[int, mmap.mmap, int, str, Optional[str]]:
         shm_fd = os.memfd_create(entry.shm_name.lstrip("/"), os.MFD_CLOEXEC)
@@ -470,7 +401,7 @@ class StageManager:
         ]
         for key in stale_keys:
             entry = self.entries.pop(key)
-            entry.close(self.cuda)
+            entry.close()
 
     def _entry_needs_restage(self, entry: Entry) -> bool:
         if entry.shm_map is None:
@@ -645,11 +576,6 @@ class StageManager:
                         raise RuntimeError("shared backing is unavailable for staging")
                     phase = "initialize_ring"
                     self._initialize_ring(entry)
-                    if not entry.cuda_registered:
-                        phase = "cuda_host_register"
-                        with TraceScope(self.trace, "daemon", "cuda_host_register_staging_buffer", artifact_path=entry.artifact_path, mapped_size=entry.mapped_size, backing_kind=entry.backing_kind):
-                            cuda_host_register_chunked(self.cuda, entry.host_address, entry.mapped_size)
-                        entry.cuda_registered = True
                     entry.state = "streaming"
 
                     phase = "posix_fadvise"
@@ -697,10 +623,10 @@ class StageManager:
             except Exception:
                 pass
             try:
-                entry.close(self.cuda)
+                entry.close()
             except Exception:
                 pass
-            entry.error = str(exc)
+            entry.error = f"{phase}: {exc}"
             entry.state = "error"
             entry.staging = False
             with self.lock:

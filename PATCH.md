@@ -115,6 +115,12 @@ There is now a daemonized fast path for disk backups:
 - if it does, the daemon passes the backing FD over the Unix socket immediately, the current process `mmap()`s it, `cudaHostRegister()`s it in-process, and restores from the shared ring while the daemon continues staging later blocks
 - if no staged ring is ready, `resume()` falls back to the existing direct disk prefetch path
 
+The daemon itself stays out of CUDA entirely:
+
+- it does not create a CUDA context
+- it does not call `cudaHostRegister()`
+- host registration happens only in the consumer process after attach
+
 Daemon entry point:
 
 - `torch-memory-saver-shm-daemon`
@@ -138,7 +144,7 @@ Daemon-related environment variables:
 - `TMS_SHM_DAEMON_MAX_STAGED_BYTES`
   optional daemon-wide cap for staged hugepage-backed buffers before LRU eviction
 - `TMS_SHM_DAEMON_TRACE_FILE`
-  if set, the daemon writes a Perfetto/Chrome trace JSON file covering ring allocation, host registration, and disk-read chunks
+  if set, the daemon writes a Perfetto/Chrome trace JSON file covering ring allocation and disk-read chunks
 
 Shared ring behavior:
 
