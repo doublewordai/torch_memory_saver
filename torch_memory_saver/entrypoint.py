@@ -23,24 +23,37 @@ class TorchMemorySaver:
         self._impl: Optional[_TorchMemorySaverImpl] = None
 
     @contextmanager
-    def region(self, tag: str = _TAG_DEFAULT, enable_cpu_backup: bool = False):
+    def region(
+            self,
+            tag: str = _TAG_DEFAULT,
+            enable_cpu_backup: bool = False,
+            disk_backup_loc: Optional[str] = None,
+    ):
         """Context manager for memory saving with optional tag"""
         self._ensure_initialized()
-        with self._impl.region(tag=tag, enable_cpu_backup=enable_cpu_backup):
+        with self._impl.region(
+                tag=tag,
+                enable_cpu_backup=enable_cpu_backup,
+                disk_backup_loc=disk_backup_loc,
+        ):
             yield
 
     @contextmanager
     def cuda_graph(
             self,
             cuda_graph, pool=None, stream=None, capture_error_mode='global',
-            tag: str = _TAG_DEFAULT, enable_cpu_backup: bool = False,
+            tag: str = _TAG_DEFAULT,
+            enable_cpu_backup: bool = False,
+            disk_backup_loc: Optional[str] = None,
     ):
         """Similar to `torch.cuda.graph`, but ensures memory in it to be pauseable."""
         self._ensure_initialized()
         with self._impl.cuda_graph(
                 cuda_graph=cuda_graph,
                 pool=pool, stream=stream, capture_error_mode=capture_error_mode,
-                tag=tag, enable_cpu_backup=enable_cpu_backup,
+                tag=tag,
+                enable_cpu_backup=enable_cpu_backup,
+                disk_backup_loc=disk_backup_loc,
         ):
             yield
 
@@ -109,39 +122,82 @@ class _TorchMemorySaverImpl:
             atexit.register(self._mem_pools.clear)
 
     @contextmanager
-    def region(self, tag: str, enable_cpu_backup: bool):
+    def region(
+            self,
+            tag: str,
+            enable_cpu_backup: bool,
+            disk_backup_loc: Optional[str],
+    ):
         # For hook_mode=preload, we need this b/c https://github.com/fzyzcjy/torch_memory_saver/pull/20#issuecomment-3047099047
         # (For hook_mode=torch we may not need it, but currently our primary usage is hook_mode=preload, thus we do this for simplicity)
-        mem_pool = self._mem_pools[(tag, enable_cpu_backup)]
+        disk_backup_path = _normalize_disk_backup_options(
+            enable_cpu_backup=enable_cpu_backup,
+            disk_backup_loc=disk_backup_loc,
+        )
+        mem_pool = self._mem_pools[(tag, enable_cpu_backup, disk_backup_path)]
         with torch.cuda.use_mem_pool(mem_pool):
-            with self._with_region_config(tag=tag, enable_cpu_backup=enable_cpu_backup):
+            with self._with_region_config(
+                    tag=tag,
+                    enable_cpu_backup=enable_cpu_backup,
+                    disk_backup_path=disk_backup_path,
+            ):
                 yield
 
     @contextmanager
-    def cuda_graph(self, cuda_graph, pool, stream, capture_error_mode, tag: str, enable_cpu_backup: bool):
+    def cuda_graph(
+            self,
+            cuda_graph,
+            pool,
+            stream,
+            capture_error_mode,
+            tag: str,
+            enable_cpu_backup: bool,
+            disk_backup_loc: Optional[str],
+    ):
         assert self._hook_mode == "preload", "Only hook_mode=preload supports pauseable CUDA Graph currently"
+        disk_backup_path = _normalize_disk_backup_options(
+            enable_cpu_backup=enable_cpu_backup,
+            disk_backup_loc=disk_backup_loc,
+        )
         with torch.cuda.graph(cuda_graph, pool=pool, stream=stream, capture_error_mode=capture_error_mode):
-            with self._with_region_config(tag=tag, enable_cpu_backup=enable_cpu_backup):
+            with self._with_region_config(
+                    tag=tag,
+                    enable_cpu_backup=enable_cpu_backup,
+                    disk_backup_path=disk_backup_path,
+            ):
                 yield
 
     @contextmanager
-    def _with_region_config(self, tag: str, enable_cpu_backup: bool):
+    def _with_region_config(
+            self,
+            tag: str,
+            enable_cpu_backup: bool,
+            disk_backup_path: str,
+    ):
         cdll = self._binary_wrapper.cdll
         orig_tag = cdll.tms_get_current_tag().decode("utf-8")
         orig_interesting_region = cdll.tms_get_interesting_region()
         orig_enable_cpu_backup = cdll.tms_get_enable_cpu_backup()
+        orig_disk_backup_path = cdll.tms_get_disk_backup_path().decode("utf-8")
 
-        self._binary_wrapper.set_config(tag=tag, interesting_region=True, enable_cpu_backup=enable_cpu_backup)
+        self._binary_wrapper.set_config(
+            tag=tag,
+            interesting_region=True,
+            enable_cpu_backup=enable_cpu_backup,
+            disk_backup_path=disk_backup_path,
+        )
         try:
             yield
         finally:
             assert cdll.tms_get_interesting_region()
             assert cdll.tms_get_enable_cpu_backup() == enable_cpu_backup
             assert cdll.tms_get_current_tag().decode("utf-8") == tag
+            assert cdll.tms_get_disk_backup_path().decode("utf-8") == disk_backup_path
             self._binary_wrapper.set_config(
                 tag=orig_tag,
                 interesting_region=orig_interesting_region,
                 enable_cpu_backup=orig_enable_cpu_backup,
+                disk_backup_path=orig_disk_backup_path,
             )
 
     @contextmanager
@@ -199,3 +255,15 @@ def _sanity_checks():
         raise RuntimeError(
             "TorchMemorySaver is disabled for the current process because expandable_segments is not supported yet."
         )
+
+
+def _normalize_disk_backup_options(
+        *,
+        enable_cpu_backup: bool,
+        disk_backup_loc: Optional[str],
+) -> str:
+    disk_backup_loc = disk_backup_loc or ""
+
+    if enable_cpu_backup and disk_backup_loc:
+        raise ValueError("enable_cpu_backup and disk_backup_loc are mutually exclusive")
+    return disk_backup_loc

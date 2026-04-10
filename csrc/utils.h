@@ -1,6 +1,8 @@
 #pragma once
 #include <iostream>
 #include <vector>
+#include <cerrno>
+#include <cstdlib>
 #include "macro.h"
 
 // #define TMS_DEBUG_LOG
@@ -170,4 +172,30 @@ inline bool get_bool_env_var(const char* name) {
               << " name=" << name << " value=" << env_str
               << std::endl;
     exit(1);
+}
+
+inline std::string get_string_env_var(const char* name) {
+    const char* env_cstr = std::getenv(name);
+    if (env_cstr == nullptr) {
+        return "";
+    }
+    return std::string(env_cstr);
+}
+
+inline uint64_t get_uint64_env_var(const char* name, uint64_t default_value) {
+    const char* env_cstr = std::getenv(name);
+    if (env_cstr == nullptr) {
+        return default_value;
+    }
+
+    char* end_ptr = nullptr;
+    errno = 0;
+    const unsigned long long value = std::strtoull(env_cstr, &end_ptr, 10);
+    if (errno != 0 || end_ptr == env_cstr || *end_ptr != '\0') {
+        std::cerr << "[torch_memory_saver.cpp] Unsupported uint64 environment variable value "
+                  << " name=" << name << " value=" << env_cstr
+                  << std::endl;
+        exit(1);
+    }
+    return static_cast<uint64_t>(value);
 }
