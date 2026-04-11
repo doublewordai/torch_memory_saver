@@ -5,6 +5,7 @@
 #include "api_forwarder.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <fcntl.h>
@@ -977,16 +978,18 @@ uint64_t consume_shared_ring_ready(
     std::vector<SharedInFlightBlock>& pending_blocks
 ) {
     const auto start = std::chrono::steady_clock::now();
-    uint64_t expected_file_offset = 0;
     SharedRingBlockHeader* block_headers = shared_ring_block_headers(mapping);
-    size_t ready_block_count = 0;
 
-    while (expected_file_offset < mapping.artifact_size) {
+    // Phase 1: Scan all READY blocks in file-offset order and collect their indices.
+    std::vector<size_t> ready_indices;
+    std::vector<uint64_t> ready_file_offsets;
+    uint64_t scan_offset = 0;
+    while (scan_offset < mapping.artifact_size) {
         size_t block_index = SIZE_MAX;
         for (size_t i = 0; i < mapping.block_count; ++i) {
             const SharedRingBlockHeader& block = block_headers[i];
             if (atomic_load_u32(&block.state) == static_cast<uint32_t>(SharedRingBlockState::READY) &&
-                atomic_load_u64(&block.file_offset) == expected_file_offset) {
+                atomic_load_u64(&block.file_offset) == scan_offset) {
                 block_index = i;
                 break;
             }
@@ -994,27 +997,71 @@ uint64_t consume_shared_ring_ready(
         if (block_index == SIZE_MAX) {
             break;
         }
-
         atomic_store_u32(&block_headers[block_index].state, static_cast<uint32_t>(SharedRingBlockState::READING));
-        ensure_shared_ring_block_registered(mapping, block_index);
+        ready_indices.push_back(block_index);
+        ready_file_offsets.push_back(scan_offset);
+        scan_offset += atomic_load_u64(&block_headers[block_index].valid_bytes);
+    }
+
+    const size_t ready_block_count = ready_indices.size();
+    if (ready_block_count == 0) {
+        const auto end = std::chrono::steady_clock::now();
+        std::cout << "[torch_memory_saver.cpp] shared ring ready drain"
+                  << " artifact_bytes=" << mapping.artifact_size
+                  << " ready_blocks=0"
+                  << " ready_bytes=0"
+                  << " elapsed_ms=" << duration_ms(start, end)
+                  << std::endl;
+        return 0;
+    }
+
+    // Phase 2: Overlap registration with H2D copies using a producer thread.
+    // The registration thread registers blocks ahead of the main thread which
+    // enqueues H2D copies.  This fully overlaps cudaHostRegister (CPU-side page
+    // pinning) with GPU DMA transfers.
+    std::atomic<size_t> registered_count{0};
+    const auto register_start = std::chrono::steady_clock::now();
+
+    std::thread register_thread([&]() {
+        for (size_t i = 0; i < ready_block_count; ++i) {
+            ensure_shared_ring_block_registered(mapping, ready_indices[i]);
+            registered_count.store(i + 1, std::memory_order_release);
+        }
+    });
+
+    uint64_t copy_total_us = 0;
+    for (size_t i = 0; i < ready_block_count; ++i) {
+        // Spin-wait until the registration thread has registered this block.
+        while (registered_count.load(std::memory_order_acquire) <= i) {
+            // Yield to avoid burning CPU while waiting for the first block.
+            std::this_thread::yield();
+        }
+
+        const size_t block_index = ready_indices[i];
         std::unordered_map<int, BatchMemcpyGroup> h2d_groups;
         collect_shared_ring_block_copies(mapping, block_index, path_items, allocation_index, allocation_offset, h2d_groups);
         const std::vector<int> used_devices = get_used_devices(h2d_groups);
+        const auto copy_start = std::chrono::steady_clock::now();
         enqueue_batch_memcpy_async(async_memcpy_context, h2d_groups, cudaMemcpyHostToDevice);
+        const auto copy_end = std::chrono::steady_clock::now();
+        copy_total_us += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(copy_end - copy_start).count());
         record_shared_block_events(async_memcpy_context, block_index, used_devices, pending_blocks);
-        ready_block_count += 1;
-        expected_file_offset += atomic_load_u64(&block_headers[block_index].valid_bytes);
     }
+
+    register_thread.join();
+    const auto register_end = std::chrono::steady_clock::now();
 
     const auto end = std::chrono::steady_clock::now();
     std::cout << "[torch_memory_saver.cpp] shared ring ready drain"
               << " artifact_bytes=" << mapping.artifact_size
               << " ready_blocks=" << ready_block_count
-              << " ready_bytes=" << expected_file_offset
+              << " ready_bytes=" << scan_offset
+              << " register_thread_ms=" << duration_ms(register_start, register_end)
+              << " copy_enqueue_us=" << copy_total_us
               << " elapsed_ms=" << duration_ms(start, end)
               << std::endl;
 
-    return expected_file_offset;
+    return scan_offset;
 }
 
 void consume_shared_ring_remaining(
@@ -1026,51 +1073,116 @@ void consume_shared_ring_remaining(
     AsyncMemcpyContext& async_memcpy_context,
     std::vector<SharedInFlightBlock>& pending_blocks
 ) {
+    if (expected_file_offset >= mapping.artifact_size) {
+        // All blocks were consumed in the ready phase.
+        release_completed_shared_blocks(async_memcpy_context, mapping, pending_blocks, true);
+        return;
+    }
+
     const auto start = std::chrono::steady_clock::now();
     SharedRingGlobalHeader* header = shared_ring_global_header(mapping);
     SharedRingBlockHeader* block_headers = shared_ring_block_headers(mapping);
-    size_t remaining_block_count = 0;
+
+    // For the remaining path we use the same registration-thread pattern.
+    // A producer thread finds READY blocks and registers them; the main thread
+    // picks up registered blocks and enqueues H2D copies.
+
+    // Shared state between registration thread and main thread.
+    struct PendingRegistration {
+        size_t block_index;
+        uint64_t file_offset;
+        uint64_t valid_bytes;
+    };
+    std::vector<PendingRegistration> registered_queue;
+    std::mutex queue_mutex;
+    std::atomic<size_t> registered_count{0};
+    std::atomic<bool> registration_done{false};
+
+    std::thread register_thread([&]() {
+        uint64_t reg_offset = expected_file_offset;
+        while (reg_offset < mapping.artifact_size) {
+            // Wait for the next block to become READY.
+            size_t block_index = SIZE_MAX;
+            while (block_index == SIZE_MAX) {
+                for (size_t i = 0; i < mapping.block_count; ++i) {
+                    const SharedRingBlockHeader& block = block_headers[i];
+                    if (atomic_load_u32(&block.state) == static_cast<uint32_t>(SharedRingBlockState::READY) &&
+                        atomic_load_u64(&block.file_offset) == reg_offset) {
+                        block_index = i;
+                        break;
+                    }
+                }
+                if (block_index != SIZE_MAX) {
+                    break;
+                }
+                if (atomic_load_u32(&header->error_code) != 0) {
+                    registration_done.store(true, std::memory_order_release);
+                    return;
+                }
+                if (atomic_load_u32(&header->producer_done) == 1) {
+                    // Scan once more before giving up.
+                    for (size_t i = 0; i < mapping.block_count; ++i) {
+                        const SharedRingBlockHeader& block = block_headers[i];
+                        if (atomic_load_u32(&block.state) == static_cast<uint32_t>(SharedRingBlockState::READY) &&
+                            atomic_load_u64(&block.file_offset) == reg_offset) {
+                            block_index = i;
+                            break;
+                        }
+                    }
+                    if (block_index == SIZE_MAX) {
+                        SIMPLE_CHECK(false, "Shared ring producer completed without providing the expected block");
+                    }
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::microseconds(100));
+            }
+
+            atomic_store_u32(&block_headers[block_index].state, static_cast<uint32_t>(SharedRingBlockState::READING));
+            ensure_shared_ring_block_registered(mapping, block_index);
+
+            const uint64_t valid_bytes = atomic_load_u64(&block_headers[block_index].valid_bytes);
+            {
+                std::lock_guard<std::mutex> lock(queue_mutex);
+                registered_queue.push_back(PendingRegistration{block_index, reg_offset, valid_bytes});
+            }
+            registered_count.store(registered_count.load(std::memory_order_relaxed) + 1, std::memory_order_release);
+            reg_offset += valid_bytes;
+        }
+        registration_done.store(true, std::memory_order_release);
+    });
+
+    size_t consumed = 0;
     uint64_t resumed_bytes = 0;
     while (expected_file_offset < mapping.artifact_size) {
-        size_t block_index = SIZE_MAX;
-        while (block_index == SIZE_MAX) {
-            for (size_t i = 0; i < mapping.block_count; ++i) {
-                const SharedRingBlockHeader& block = block_headers[i];
-                if (atomic_load_u32(&block.state) == static_cast<uint32_t>(SharedRingBlockState::READY) &&
-                    atomic_load_u64(&block.file_offset) == expected_file_offset) {
-                block_index = i;
-                break;
-            }
-        }
+        // Wait for the registration thread to produce the next block.
+        while (registered_count.load(std::memory_order_acquire) <= consumed) {
             release_completed_shared_blocks(async_memcpy_context, mapping, pending_blocks, false);
-            if (block_index != SIZE_MAX) {
-                break;
-            }
-            SIMPLE_CHECK(atomic_load_u32(&header->error_code) != kSharedRingErrorGeneric, "Shared ring producer reported an error");
-            if (atomic_load_u32(&header->producer_done) == 1 && block_index == SIZE_MAX) {
-                SIMPLE_CHECK(false, "Shared ring producer completed without providing the expected block");
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            std::this_thread::yield();
         }
 
-        atomic_store_u32(&block_headers[block_index].state, static_cast<uint32_t>(SharedRingBlockState::READING));
-        ensure_shared_ring_block_registered(mapping, block_index);
+        PendingRegistration reg;
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex);
+            reg = registered_queue[consumed];
+        }
+        consumed += 1;
+
         std::unordered_map<int, BatchMemcpyGroup> h2d_groups;
-        collect_shared_ring_block_copies(mapping, block_index, path_items, allocation_index, allocation_offset, h2d_groups);
+        collect_shared_ring_block_copies(mapping, reg.block_index, path_items, allocation_index, allocation_offset, h2d_groups);
         const std::vector<int> used_devices = get_used_devices(h2d_groups);
         enqueue_batch_memcpy_async(async_memcpy_context, h2d_groups, cudaMemcpyHostToDevice);
-        record_shared_block_events(async_memcpy_context, block_index, used_devices, pending_blocks);
-        const uint64_t block_bytes = atomic_load_u64(&block_headers[block_index].valid_bytes);
-        expected_file_offset += block_bytes;
-        resumed_bytes += block_bytes;
-        remaining_block_count += 1;
+        record_shared_block_events(async_memcpy_context, reg.block_index, used_devices, pending_blocks);
+        expected_file_offset += reg.valid_bytes;
+        resumed_bytes += reg.valid_bytes;
     }
+
+    register_thread.join();
     release_completed_shared_blocks(async_memcpy_context, mapping, pending_blocks, true);
     const auto end = std::chrono::steady_clock::now();
     std::cout << "[torch_memory_saver.cpp] shared ring remaining drain"
               << " artifact_bytes=" << mapping.artifact_size
               << " resumed_bytes=" << resumed_bytes
-              << " blocks=" << remaining_block_count
+              << " blocks=" << consumed
               << " elapsed_ms=" << duration_ms(start, end)
               << std::endl;
 }
