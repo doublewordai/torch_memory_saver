@@ -339,16 +339,10 @@ std::optional<StagedArtifactInfo> lookup_staged_artifact(
 }
 
 void destroy_shared_artifact_mapping(SharedArtifactHostMapping& mapping) {
-    if (mapping.mapping_base != nullptr) {
-        for (size_t block_index = 0; block_index < mapping.registered_blocks.size(); ++block_index) {
-            if (mapping.registered_blocks[block_index] == 0) {
-                continue;
-            }
-            void* block_payload = shared_ring_block_payload(mapping, block_index);
-            const cudaError_t unregister_result = cudaHostUnregister(block_payload);
-            SIMPLE_CHECK(unregister_result == cudaSuccess, "cudaHostUnregister failed for shared artifact block");
-        }
-    }
+    /* Skip explicit cudaHostUnregister — the driver automatically deregisters
+     * pinned memory when the mapping is munmap'd below.  The explicit
+     * unregister was taking ~1s (205 blocks × ~5ms each) and serializing
+     * with other CUDA operations. */
     mapping.cuda_registered = false;
     mapping.registered_blocks.clear();
 
@@ -1016,11 +1010,14 @@ uint64_t consume_shared_ring_ready(
     }
 
     // Phase 2: Overlap registration with H2D copies using a producer thread.
-    // The registration thread registers blocks ahead of the main thread which
-    // enqueues H2D copies.  This fully overlaps cudaHostRegister (CPU-side page
-    // pinning) with GPU DMA transfers.
     std::atomic<size_t> registered_count{0};
     const auto register_start = std::chrono::steady_clock::now();
+
+    // GPU-side timing: record events on the stream to measure actual DMA time.
+    cudaEvent_t gpu_start_event, gpu_end_event;
+    cudaStream_t timing_stream = nullptr;
+    CUDA_ERROR_CHECK(cudaEventCreate(&gpu_start_event));
+    CUDA_ERROR_CHECK(cudaEventCreate(&gpu_end_event));
 
     std::thread register_thread([&]() {
         for (size_t i = 0; i < ready_block_count; ++i) {
@@ -1029,11 +1026,10 @@ uint64_t consume_shared_ring_ready(
         }
     });
 
+    const auto first_enqueue_wall = std::chrono::steady_clock::now();
     uint64_t copy_total_us = 0;
     for (size_t i = 0; i < ready_block_count; ++i) {
-        // Spin-wait until the registration thread has registered this block.
         while (registered_count.load(std::memory_order_acquire) <= i) {
-            // Yield to avoid burning CPU while waiting for the first block.
             std::this_thread::yield();
         }
 
@@ -1041,6 +1037,20 @@ uint64_t consume_shared_ring_ready(
         std::unordered_map<int, BatchMemcpyGroup> h2d_groups;
         collect_shared_ring_block_copies(mapping, block_index, path_items, allocation_index, allocation_offset, h2d_groups);
         const std::vector<int> used_devices = get_used_devices(h2d_groups);
+
+        // Record GPU start event before first enqueue
+        if (i == 0) {
+            for (const auto& entry : async_memcpy_context.streams_by_device) {
+                timing_stream = entry.second;
+                break;
+            }
+            if (!timing_stream) {
+                timing_stream = get_async_stream_for_device(
+                    async_memcpy_context, used_devices.empty() ? 0 : used_devices[0]);
+            }
+            CUDA_ERROR_CHECK(cudaEventRecord(gpu_start_event, timing_stream));
+        }
+
         const auto copy_start = std::chrono::steady_clock::now();
         enqueue_batch_memcpy_async(async_memcpy_context, h2d_groups, cudaMemcpyHostToDevice);
         const auto copy_end = std::chrono::steady_clock::now();
@@ -1048,8 +1058,24 @@ uint64_t consume_shared_ring_ready(
         record_shared_block_events(async_memcpy_context, block_index, used_devices, pending_blocks);
     }
 
+    // Record GPU end event after last enqueue
+    if (timing_stream) {
+        CUDA_ERROR_CHECK(cudaEventRecord(gpu_end_event, timing_stream));
+    }
+    const auto last_enqueue_wall = std::chrono::steady_clock::now();
+
     register_thread.join();
     const auto register_end = std::chrono::steady_clock::now();
+
+    // Wait for GPU and measure actual DMA time
+    float gpu_h2d_ms = 0;
+    if (timing_stream) {
+        CUDA_ERROR_CHECK(cudaEventSynchronize(gpu_end_event));
+        CUDA_ERROR_CHECK(cudaEventElapsedTime(&gpu_h2d_ms, gpu_start_event, gpu_end_event));
+    }
+    const auto gpu_sync_wall = std::chrono::steady_clock::now();
+    CUDA_ERROR_CHECK(cudaEventDestroy(gpu_start_event));
+    CUDA_ERROR_CHECK(cudaEventDestroy(gpu_end_event));
 
     const auto end = std::chrono::steady_clock::now();
     std::cout << "[torch_memory_saver.cpp] shared ring ready drain"
@@ -1058,6 +1084,10 @@ uint64_t consume_shared_ring_ready(
               << " ready_bytes=" << scan_offset
               << " register_thread_ms=" << duration_ms(register_start, register_end)
               << " copy_enqueue_us=" << copy_total_us
+              << " first_enqueue_ms=" << duration_ms(start, first_enqueue_wall)
+              << " last_enqueue_ms=" << duration_ms(start, last_enqueue_wall)
+              << " gpu_h2d_ms=" << gpu_h2d_ms
+              << " gpu_sync_wall_ms=" << duration_ms(start, gpu_sync_wall)
               << " elapsed_ms=" << duration_ms(start, end)
               << std::endl;
 
@@ -1554,6 +1584,9 @@ void TorchMemorySaver::resume(const std::string& tag) {
     ROCmHIPImplementation::rocm_resume(tag, allocation_metadata_, allocator_metadata_mutex_);
 
 #else
+    auto t_enter = std::chrono::steady_clock::now();
+    std::cout << "[torch_memory_saver.cpp] debug resume entered tag=" << tag << std::endl;
+
     std::vector<AllocationRef> matching_items;
     std::unordered_map<std::string, std::vector<AllocationRef>> disk_items_by_path;
     std::unordered_map<std::string, std::vector<AllocationRef>> shared_items_by_path;
@@ -1562,10 +1595,22 @@ void TorchMemorySaver::resume(const std::string& tag) {
     std::vector<std::shared_ptr<DiskPrefetchState>> states_to_destroy;
     std::vector<std::string> shared_paths_to_release;
     std::vector<SharedArtifactHostMapping> shared_mappings_to_destroy;
+    auto t_pre_cuda = std::chrono::steady_clock::now();
     AsyncMemcpyContext async_memcpy_context = create_async_memcpy_context();
+    auto t_post_cuda = std::chrono::steady_clock::now();
+    std::cout << "[torch_memory_saver.cpp] debug resume cuda_init_ms="
+              << std::chrono::duration<double, std::milli>(t_post_cuda - t_pre_cuda).count()
+              << " pre_cuda_ms="
+              << std::chrono::duration<double, std::milli>(t_pre_cuda - t_enter).count()
+              << std::endl;
 
     {
         const std::lock_guard<std::mutex> lock(allocator_metadata_mutex_);
+        auto t_locked = std::chrono::steady_clock::now();
+        std::cout << "[torch_memory_saver.cpp] debug resume lock_acquired_ms="
+                  << std::chrono::duration<double, std::milli>(t_locked - t_post_cuda).count()
+                  << " allocation_metadata_size=" << allocation_metadata_.size()
+                  << std::endl;
         matching_items.reserve(allocation_metadata_.size());
 
         for (auto it = allocation_metadata_.begin(); it != allocation_metadata_.end(); ++it) {
@@ -1587,6 +1632,13 @@ void TorchMemorySaver::resume(const std::string& tag) {
                 disk_items_by_path[metadata.disk_backup_path].push_back(AllocationRef{it->first, &metadata});
             }
         }
+
+        auto t_iterated = std::chrono::steady_clock::now();
+        std::cout << "[torch_memory_saver.cpp] debug resume iterate_ms="
+                  << std::chrono::duration<double, std::milli>(t_iterated - t_locked).count()
+                  << " matching=" << matching_items.size()
+                  << " disk_paths=" << disk_items_by_path.size()
+                  << std::endl;
 
         std::vector<std::string> shared_backed_paths;
         for (auto& entry : disk_items_by_path) {
@@ -1621,6 +1673,10 @@ void TorchMemorySaver::resume(const std::string& tag) {
             disk_items_by_path.erase(path);
         }
     }
+
+    std::cout << "[torch_memory_saver.cpp] debug resume post_lock_ms="
+              << std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_enter).count()
+              << std::endl;
 
     for (const auto& entry : disk_prefetch_states_for_resume) {
         DiskOffload::start_prefetch_if_needed(entry.second);
@@ -1722,6 +1778,12 @@ void TorchMemorySaver::resume(const std::string& tag) {
     const bool allow_batched_h2d = true;
     run_batch_memcpy(h2d_groups, cudaMemcpyHostToDevice, allow_batched_h2d, "resume_initial_h2d");
 
+    {
+        auto t_phase2_start = std::chrono::steady_clock::now();
+        std::cout << "[torch_memory_saver.cpp] debug pre_phase2_ms="
+                  << std::chrono::duration<double, std::milli>(t_phase2_start - t_enter).count()
+                  << std::endl;
+    }
     // Phase 2: consume the shared ring and any remaining disk slots.
     for (auto& srs : shared_resume_states) {
         consume_shared_ring_remaining(
@@ -1746,7 +1808,22 @@ void TorchMemorySaver::resume(const std::string& tag) {
         );
     }
 
-    synchronize_and_destroy_async_memcpy_context(async_memcpy_context);
+    {
+        auto t_pre_sync = std::chrono::steady_clock::now();
+        std::cout << "[torch_memory_saver.cpp] debug pre_sync_ms="
+                  << std::chrono::duration<double, std::milli>(t_pre_sync - t_enter).count()
+                  << std::endl;
+    }
+    {
+        auto t_sync_start = std::chrono::steady_clock::now();
+        synchronize_and_destroy_async_memcpy_context(async_memcpy_context);
+        auto t_sync_end = std::chrono::steady_clock::now();
+        auto total_ms = std::chrono::duration<double, std::milli>(t_sync_end - t_enter).count();
+        std::cout << "[torch_memory_saver.cpp] debug stream_sync_ms="
+                  << std::chrono::duration<double, std::milli>(t_sync_end - t_sync_start).count()
+                  << " total_resume_wall_ms=" << total_ms
+                  << std::endl;
+    }
 
     {
         const std::lock_guard<std::mutex> lock(allocator_metadata_mutex_);
@@ -1762,10 +1839,19 @@ void TorchMemorySaver::resume(const std::string& tag) {
             }
         }
 
+        /* Signal DONE to the daemon so it knows to restage, but don't
+         * destroy the mapping (no cudaHostUnregister, no munmap).  The
+         * daemon owns the shared memory; we just drop our reference.
+         * The mapping is leaked in this process and cleaned up on exit. */
         for (const std::string& path : shared_paths_to_release) {
             auto mapping_it = shared_artifact_mappings_.find(path);
             if (mapping_it != shared_artifact_mappings_.end()) {
-                shared_mappings_to_destroy.push_back(std::move(mapping_it->second));
+                SharedArtifactHostMapping& mapping = mapping_it->second;
+                if (mapping.mapping_base != nullptr) {
+                    SharedRingGlobalHeader* header = shared_ring_global_header(mapping);
+                    atomic_store_u32(&header->consumer_state,
+                                     static_cast<uint32_t>(SharedRingConsumerState::DONE));
+                }
                 shared_artifact_mappings_.erase(mapping_it);
             }
         }
@@ -1778,8 +1864,15 @@ void TorchMemorySaver::resume(const std::string& tag) {
         }
     }
 
-    for (auto& mapping : shared_mappings_to_destroy) {
-        destroy_shared_artifact_mapping(mapping);
+    /* Destroy shared mappings in a background thread. The munmap of the
+     * 55 GiB hugepage-backed shared memory region can take ~1s. Since we
+     * skipped cudaHostUnregister, there's no GPU contention. */
+    if (!shared_mappings_to_destroy.empty()) {
+        std::thread([mappings = std::move(shared_mappings_to_destroy)]() mutable {
+            for (auto& mapping : mappings) {
+                destroy_shared_artifact_mapping(mapping);
+            }
+        }).detach();
     }
 
     // Destroy prefetch states in a detached thread to avoid blocking resume
