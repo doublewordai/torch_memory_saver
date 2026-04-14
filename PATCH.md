@@ -30,6 +30,7 @@ Rules:
 
 - `enable_cpu_backup` and `disk_backup_loc` are mutually exclusive.
 - `disk_backup_loc` points at the file used to persist paused contents for the region.
+- when `disk_backup_loc` is omitted, TMS can fall back to a tag-scoped env default via `TMS_TAG_DISK_BACKUP_LOC_<TAG>`
 
 ### `torch_memory_saver.cuda_graph(...)`
 
@@ -169,6 +170,14 @@ The current daemon implementation restages a backup after the previous consumer 
 New thread-local init variable:
 
 - `TMS_INIT_DISK_BACKUP_PATH`
+
+New tag-scoped env default:
+
+- `TMS_TAG_DISK_BACKUP_LOC_<TAG>`
+  - used only when `disk_backup_loc` is omitted
+  - `<TAG>` is uppercased and non-alphanumeric runs become `_`
+  - example: `tag="weights"` maps to `TMS_TAG_DISK_BACKUP_LOC_WEIGHTS`
+  - example: `tag="kv_cache"` maps to `TMS_TAG_DISK_BACKUP_LOC_KV_CACHE`
 
 Existing init variables still apply:
 

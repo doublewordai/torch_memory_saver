@@ -4,6 +4,7 @@ import ctypes
 import numpy as np
 import logging
 import os
+import re
 from collections import defaultdict
 from contextlib import contextmanager
 from typing import Optional
@@ -15,6 +16,7 @@ from .hooks.base import HookUtilBase, HookMode
 logger = logging.getLogger(__name__)
 
 _TAG_DEFAULT = "default"
+_TAG_DISK_BACKUP_ENV_PREFIX = "TMS_TAG_DISK_BACKUP_LOC_"
 
 
 class TorchMemorySaver:
@@ -131,6 +133,7 @@ class _TorchMemorySaverImpl:
         # For hook_mode=preload, we need this b/c https://github.com/fzyzcjy/torch_memory_saver/pull/20#issuecomment-3047099047
         # (For hook_mode=torch we may not need it, but currently our primary usage is hook_mode=preload, thus we do this for simplicity)
         disk_backup_path = _normalize_disk_backup_options(
+            tag=tag,
             enable_cpu_backup=enable_cpu_backup,
             disk_backup_loc=disk_backup_loc,
         )
@@ -156,6 +159,7 @@ class _TorchMemorySaverImpl:
     ):
         assert self._hook_mode == "preload", "Only hook_mode=preload supports pauseable CUDA Graph currently"
         disk_backup_path = _normalize_disk_backup_options(
+            tag=tag,
             enable_cpu_backup=enable_cpu_backup,
             disk_backup_loc=disk_backup_loc,
         )
@@ -259,11 +263,29 @@ def _sanity_checks():
 
 def _normalize_disk_backup_options(
         *,
+        tag: str,
         enable_cpu_backup: bool,
         disk_backup_loc: Optional[str],
 ) -> str:
-    disk_backup_loc = disk_backup_loc or ""
+    if disk_backup_loc is not None:
+        disk_backup_loc = disk_backup_loc or ""
+        if enable_cpu_backup and disk_backup_loc:
+            raise ValueError("enable_cpu_backup and disk_backup_loc are mutually exclusive")
+        return disk_backup_loc
 
-    if enable_cpu_backup and disk_backup_loc:
-        raise ValueError("enable_cpu_backup and disk_backup_loc are mutually exclusive")
-    return disk_backup_loc
+    if enable_cpu_backup:
+        return ""
+
+    return _get_env_disk_backup_loc_for_tag(tag)
+
+
+def _get_env_disk_backup_loc_for_tag(tag: str) -> str:
+    normalized_tag = _normalize_tag_for_env(tag)
+    return os.environ.get(f"{_TAG_DISK_BACKUP_ENV_PREFIX}{normalized_tag}", "")
+
+
+def _normalize_tag_for_env(tag: str) -> str:
+    normalized = re.sub(r"[^A-Za-z0-9]+", "_", tag).strip("_").upper()
+    if not normalized:
+        raise ValueError(f"Unsupported empty tag after normalization: {tag!r}")
+    return normalized
