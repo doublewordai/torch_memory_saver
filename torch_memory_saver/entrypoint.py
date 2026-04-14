@@ -271,12 +271,28 @@ def _normalize_disk_backup_options(
         disk_backup_loc = disk_backup_loc or ""
         if enable_cpu_backup and disk_backup_loc:
             raise ValueError("enable_cpu_backup and disk_backup_loc are mutually exclusive")
-        return disk_backup_loc
+        return _maybe_add_rank_suffix(disk_backup_loc)
 
     if enable_cpu_backup:
         return ""
 
-    return _get_env_disk_backup_loc_for_tag(tag)
+    return _maybe_add_rank_suffix(_get_env_disk_backup_loc_for_tag(tag))
+
+
+def _maybe_add_rank_suffix(path: str) -> str:
+    if not path:
+        return path
+    try:
+        import torch.distributed as dist
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            rank = dist.get_rank()
+            stem, dot, ext = path.rpartition(".")
+            if dot:
+                return f"{stem}.rank{rank}.{ext}"
+            return f"{path}.rank{rank}"
+    except Exception:
+        pass
+    return path
 
 
 def _get_env_disk_backup_loc_for_tag(tag: str) -> str:
