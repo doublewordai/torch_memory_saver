@@ -23,6 +23,8 @@ class TorchMemorySaver:
     def __init__(self):
         self._impl_ctor_kwargs = {}
         self._impl: Optional[_TorchMemorySaverImpl] = None
+        self._pause_hooks: dict[str, list] = defaultdict(list)
+        self._resume_hooks: dict[str, list] = defaultdict(list)
 
     @contextmanager
     def region(
@@ -65,14 +67,26 @@ class TorchMemorySaver:
         with self._impl.disable():
             yield
 
+    def register_pause_hook(self, tag: str, fn):
+        self._pause_hooks[tag].append(fn)
+
+    def register_resume_hook(self, tag: str, fn):
+        self._resume_hooks[tag].append(fn)
+
     def pause(self, tag: Optional[str] = None):
         """Pause memory for specific tag or all memory if tag is None"""
         self._ensure_initialized()
         self._impl.pause(tag=tag)
+        if tag is not None:
+            for fn in self._pause_hooks.get(tag, ()):
+                fn()
 
     def resume(self, tag: Optional[str] = None):
         """Resume memory for specific tag or all memory if tag is None"""
         self._ensure_initialized()
+        if tag is not None:
+            for fn in self._resume_hooks.get(tag, ()):
+                fn()
         self._impl.resume(tag=tag)
 
     # for compatibility
