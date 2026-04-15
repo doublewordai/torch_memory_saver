@@ -492,7 +492,16 @@ bool ensure_shared_ring_block_registered(SharedArtifactHostMapping& mapping, siz
     const auto start = std::chrono::steady_clock::now();
     void* block_payload = shared_ring_block_payload(mapping, block_index);
     const cudaError_t register_result = cudaHostRegister(block_payload, mapping.block_payload_bytes, cudaHostRegisterPortable);
-    SIMPLE_CHECK(register_result == cudaSuccess, "cudaHostRegister failed for shared artifact block");
+    if (register_result != cudaSuccess) {
+        std::cerr << "[torch_memory_saver.cpp] cudaHostRegister failed for shared artifact block"
+                  << " block_index=" << block_index
+                  << " block_bytes=" << mapping.block_payload_bytes
+                  << " error=" << register_result
+                  << " (" << cudaGetErrorString(register_result) << ")"
+                  << " file=" << __FILE__ << " func=" << __func__ << " line=" << __LINE__
+                  << std::endl;
+        return false;
+    }
     const auto end = std::chrono::steady_clock::now();
     mapping.registered_blocks[block_index] = 1;
     mapping.cuda_registered = true;

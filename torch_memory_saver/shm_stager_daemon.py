@@ -299,7 +299,7 @@ class SharedRingLayout:
     def __init__(self, block_payload_bytes: int, block_count: int) -> None:
         self.block_payload_bytes = align_up(max(block_payload_bytes, K_DIRECT_IO_ALIGNMENT), K_DIRECT_IO_ALIGNMENT)
         self.block_count = max(2, block_count)
-        self.headers_bytes = align_up(K_GLOBAL_BYTES + self.block_count * K_BLOCK_HEADER_BYTES, K_DIRECT_IO_ALIGNMENT)
+        self.headers_bytes = align_up(K_GLOBAL_BYTES + self.block_count * K_BLOCK_HEADER_BYTES, K_HUGEPAGE_ALIGNMENT)
         self.mapped_size = align_up(self.headers_bytes + self.block_count * self.block_payload_bytes, K_HUGEPAGE_ALIGNMENT)
 
 
