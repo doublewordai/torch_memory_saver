@@ -866,6 +866,8 @@ class StageManager:
                         phase = "pread_into"
                         with TraceScope(self.trace, "daemon", "disk_read_into_ring_block", artifact_path=entry.artifact_path, block_index=chosen_block, file_offset=next_read_offset, valid_bytes=valid_bytes, aligned_bytes=aligned_bytes):
                             reader.read_into(payload_address, valid_bytes, aligned_bytes, next_read_offset)
+                        if valid_bytes < entry.block_payload_bytes:
+                            ctypes.memset(payload_address + valid_bytes, 0, entry.block_payload_bytes - valid_bytes)
                         self._write_block(entry, chosen_block, K_BLOCK_STATE_READY, next_read_offset, valid_bytes, sequence)
                         next_read_offset += valid_bytes
                         sequence += 1
