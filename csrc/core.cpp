@@ -23,6 +23,7 @@
 namespace {
 
 constexpr const char* kShmDaemonSocketEnv = "TMS_SHM_DAEMON_SOCKET";
+constexpr const char* kResumeTransferModeEnv = "TMS_RESUME_TRANSFER_MODE";
 constexpr const char* kArtifactCompleteSuffix = ".complete";
 constexpr size_t kCudaHostRegisterChunkBytes = 1ull << 30;
 constexpr size_t kSharedArtifactCopyChunkBytes = 128ull * 1024ull * 1024ull;
@@ -70,6 +71,11 @@ bool should_return_host_backup(const AllocationMetadata& metadata) {
 
 std::string get_shm_daemon_socket_path() {
     return get_string_env_var(kShmDaemonSocketEnv);
+}
+
+bool use_direct_transfer_mode() {
+    static const bool direct = (get_string_env_var(kResumeTransferModeEnv) == "direct");
+    return direct;
 }
 
 std::string artifact_completion_marker_path(const std::string& artifact_path) {
@@ -483,6 +489,9 @@ size_t total_group_copies(const std::unordered_map<int, BatchMemcpyGroup>& group
 
 bool ensure_shared_ring_block_registered(SharedArtifactHostMapping& mapping, size_t block_index) {
     SIMPLE_CHECK(block_index < mapping.block_count, "Shared ring block index out of range");
+    if (use_direct_transfer_mode()) {
+        return false;
+    }
     if (mapping.registered_blocks.empty()) {
         mapping.registered_blocks.assign(mapping.block_count, 0);
     }
@@ -1440,6 +1449,13 @@ void TorchMemorySaver::resume(const std::string& tag) {
     ROCmHIPImplementation::rocm_resume(tag, allocation_metadata_, allocator_metadata_mutex_);
 
 #else
+    static std::once_flag transfer_mode_log;
+    std::call_once(transfer_mode_log, []() {
+        const bool direct = use_direct_transfer_mode();
+        std::cout << "[torch_memory_saver.cpp] resume transfer_mode="
+                  << (direct ? "direct" : "registered") << std::endl;
+    });
+
     std::vector<AllocationRef> matching_items;
     std::unordered_map<std::string, std::vector<AllocationRef>> disk_items_by_path;
     std::unordered_map<std::string, std::vector<AllocationRef>> shared_items_by_path;
