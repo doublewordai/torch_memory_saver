@@ -356,7 +356,7 @@ class StageManager:
             max_staged_bytes=self.max_staged_bytes,
         )
         if self.watch_dirs:
-            self.scan_thread = threading.Thread(target=self._scan_loop, daemon=True)
+            self.scan_thread = threading.Thread(target=self._scan_loop, daemon=True, name="scan-loop")
             self.scan_thread.start()
 
     def close(self) -> None:
@@ -729,23 +729,30 @@ class StageManager:
         return entry
 
     def _scan_loop(self) -> None:
-        while not self.stop_event.is_set():
-            for watch_dir in self.watch_dirs:
-                try:
-                    for child in Path(watch_dir).iterdir():
-                        if not child.is_file() or child.suffix != K_ARTIFACT_COMPLETE_SUFFIX:
-                            continue
-                        try:
-                            marker = self._read_completion_marker(child)
-                            artifact_path = str(child.with_suffix(""))
-                            if not os.path.isfile(artifact_path):
+        try:
+            while not self.stop_event.is_set():
+                for watch_dir in self.watch_dirs:
+                    try:
+                        for child in Path(watch_dir).iterdir():
+                            if not child.is_file() or child.suffix != K_ARTIFACT_COMPLETE_SUFFIX:
                                 continue
-                            self.ensure_staged(artifact_path, marker)
-                        except Exception:
-                            continue
-                except FileNotFoundError:
-                    continue
-            self.stop_event.wait(self.scan_interval_s)
+                            try:
+                                marker = self._read_completion_marker(child)
+                                artifact_path = str(child.with_suffix(""))
+                                if not os.path.isfile(artifact_path):
+                                    continue
+                                self.ensure_staged(artifact_path, marker)
+                            except Exception as exc:
+                                sys.stderr.write(f"[torch_memory_saver.shm_daemon] scan error: {artifact_path}: {exc}\n")
+                                sys.stderr.flush()
+                                continue
+                    except FileNotFoundError:
+                        continue
+                self.stop_event.wait(self.scan_interval_s)
+        except Exception as exc:
+            self._log_event("scan_thread_crashed", error=str(exc))
+            import traceback
+            traceback.print_exc()
 
     def _read_completion_marker(self, marker_path: Path) -> CompletionMarker:
         content = marker_path.read_text(encoding="utf-8").strip()
