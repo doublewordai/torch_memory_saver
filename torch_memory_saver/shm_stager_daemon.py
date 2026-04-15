@@ -344,6 +344,7 @@ class StageManager:
         self.stop_event = threading.Event()
         self.stats = DaemonStats()
         self.scan_thread: Optional[threading.Thread] = None
+        stale_count = self._cleanup_stale_hugetlb()
         self._log_event(
             "daemon_start",
             socket_path=self.socket_path,
@@ -354,10 +355,28 @@ class StageManager:
             block_count=self.layout.block_count,
             mapped_size=self.layout.mapped_size,
             max_staged_bytes=self.max_staged_bytes,
+            stale_hugetlb_cleaned=stale_count,
         )
         if self.watch_dirs:
             self.scan_thread = threading.Thread(target=self._scan_loop, daemon=True, name="scan-loop")
             self.scan_thread.start()
+
+    def _cleanup_stale_hugetlb(self) -> int:
+        """Remove tms_* hugepage files left by a previous daemon instance."""
+        if not self.hugetlb_dir:
+            return 0
+        hugetlb_path = Path(self.hugetlb_dir)
+        if not hugetlb_path.is_dir():
+            return 0
+        count = 0
+        for child in hugetlb_path.iterdir():
+            if child.name.startswith("tms_") and child.is_file():
+                try:
+                    child.unlink()
+                    count += 1
+                except OSError:
+                    pass
+        return count
 
     def close(self) -> None:
         self.stop_event.set()
