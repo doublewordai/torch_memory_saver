@@ -1,0 +1,59 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: tms-compression-bench
+  namespace: default
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    kubernetes.io/hostname: gotenks
+  containers:
+  - name: bench
+    image: europe-west2-docker.pkg.dev/tech-426212/scratch/sglang:dev
+    imagePullPolicy: IfNotPresent
+    command: ["/bin/bash", "-lc"]
+    args:
+    - |
+      set -e
+      pip install nvidia-nvcomp-cu13 2>&1 | tail -1
+
+      # Find nvcomp paths from pip package
+      NVCOMP_DIR=$(python3 -c "import nvidia.libnvcomp; import os; print(os.path.dirname(nvidia.libnvcomp.__file__))")
+      NVCOMP_INC=$(find "$NVCOMP_DIR" -name "nvcomp.h" -printf "%h\n" | head -1)
+      NVCOMP_LIB=$(find "$NVCOMP_DIR" -name "libnvcomp.so*" -printf "%h\n" | head -1)
+      echo "nvcomp inc: $NVCOMP_INC"
+      echo "nvcomp lib: $NVCOMP_LIB"
+      ls "$NVCOMP_LIB"/libnvcomp*
+
+      cd /workspace/bench
+      echo "Building..."
+      nvcc -O2 -std=c++17 -Wno-deprecated-gpu-targets \
+        -I"$NVCOMP_INC" \
+        -L"$NVCOMP_LIB" \
+        compressed_restore.cu \
+        -l:libnvcomp.so.5 -lcurand \
+        -Xlinker -rpath,"$NVCOMP_LIB" \
+        -o compressed_restore 2>&1
+
+      echo "Running..."
+      ./compressed_restore --size-mib 1024 --block-mib 128 --iters 10
+    env:
+    - name: HF_HUB_OFFLINE
+      value: "0"
+    resources:
+      limits:
+        nvidia.com/gpu: "1"
+    volumeMounts:
+    - name: bench-src
+      mountPath: /workspace/bench
+    - name: dshm
+      mountPath: /dev/shm
+  volumes:
+  - name: bench-src
+    hostPath:
+      path: /home/fergus/checkpoints/torch_memory_saver-compressed-restore/bench
+      type: Directory
+  - name: dshm
+    hostPath:
+      path: /dev/shm
+      type: Directory
