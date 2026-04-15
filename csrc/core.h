@@ -60,6 +60,7 @@ struct SharedArtifactHostMapping {
     int shm_fd = -1;
     bool cuda_registered = false;
     std::vector<uint8_t> registered_blocks;
+    size_t coalesced_registered_bytes = 0;
 };
 
 struct SharedRingGlobalHeader {
