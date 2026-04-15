@@ -299,7 +299,7 @@ class SharedRingLayout:
     def __init__(self, block_payload_bytes: int, block_count: int) -> None:
         self.block_payload_bytes = align_up(max(block_payload_bytes, K_DIRECT_IO_ALIGNMENT), K_DIRECT_IO_ALIGNMENT)
         self.block_count = max(2, block_count)
-        self.headers_bytes = align_up(K_GLOBAL_BYTES + self.block_count * K_BLOCK_HEADER_BYTES, K_DIRECT_IO_ALIGNMENT)
+        self.headers_bytes = align_up(K_GLOBAL_BYTES + self.block_count * K_BLOCK_HEADER_BYTES, K_HUGEPAGE_ALIGNMENT)
         self.mapped_size = align_up(self.headers_bytes + self.block_count * self.block_payload_bytes, K_HUGEPAGE_ALIGNMENT)
 
 
@@ -344,6 +344,7 @@ class StageManager:
         self.stop_event = threading.Event()
         self.stats = DaemonStats()
         self.scan_thread: Optional[threading.Thread] = None
+        stale_count = self._cleanup_stale_hugetlb()
         self._log_event(
             "daemon_start",
             socket_path=self.socket_path,
@@ -354,10 +355,28 @@ class StageManager:
             block_count=self.layout.block_count,
             mapped_size=self.layout.mapped_size,
             max_staged_bytes=self.max_staged_bytes,
+            stale_hugetlb_cleaned=stale_count,
         )
         if self.watch_dirs:
-            self.scan_thread = threading.Thread(target=self._scan_loop, daemon=True)
+            self.scan_thread = threading.Thread(target=self._scan_loop, daemon=True, name="scan-loop")
             self.scan_thread.start()
+
+    def _cleanup_stale_hugetlb(self) -> int:
+        """Remove tms_* hugepage files left by a previous daemon instance."""
+        if not self.hugetlb_dir:
+            return 0
+        hugetlb_path = Path(self.hugetlb_dir)
+        if not hugetlb_path.is_dir():
+            return 0
+        count = 0
+        for child in hugetlb_path.iterdir():
+            if child.name.startswith("tms_") and child.is_file():
+                try:
+                    child.unlink()
+                    count += 1
+                except OSError:
+                    pass
+        return count
 
     def close(self) -> None:
         self.stop_event.set()
@@ -729,23 +748,30 @@ class StageManager:
         return entry
 
     def _scan_loop(self) -> None:
-        while not self.stop_event.is_set():
-            for watch_dir in self.watch_dirs:
-                try:
-                    for child in Path(watch_dir).iterdir():
-                        if not child.is_file() or child.suffix != K_ARTIFACT_COMPLETE_SUFFIX:
-                            continue
-                        try:
-                            marker = self._read_completion_marker(child)
-                            artifact_path = str(child.with_suffix(""))
-                            if not os.path.isfile(artifact_path):
+        try:
+            while not self.stop_event.is_set():
+                for watch_dir in self.watch_dirs:
+                    try:
+                        for child in Path(watch_dir).iterdir():
+                            if not child.is_file() or child.suffix != K_ARTIFACT_COMPLETE_SUFFIX:
                                 continue
-                            self.ensure_staged(artifact_path, marker)
-                        except Exception:
-                            continue
-                except FileNotFoundError:
-                    continue
-            self.stop_event.wait(self.scan_interval_s)
+                            try:
+                                marker = self._read_completion_marker(child)
+                                artifact_path = str(child.with_suffix(""))
+                                if not os.path.isfile(artifact_path):
+                                    continue
+                                self.ensure_staged(artifact_path, marker)
+                            except Exception as exc:
+                                sys.stderr.write(f"[torch_memory_saver.shm_daemon] scan error: {artifact_path}: {exc}\n")
+                                sys.stderr.flush()
+                                continue
+                    except FileNotFoundError:
+                        continue
+                self.stop_event.wait(self.scan_interval_s)
+        except Exception as exc:
+            self._log_event("scan_thread_crashed", error=str(exc))
+            import traceback
+            traceback.print_exc()
 
     def _read_completion_marker(self, marker_path: Path) -> CompletionMarker:
         content = marker_path.read_text(encoding="utf-8").strip()
@@ -840,6 +866,8 @@ class StageManager:
                         phase = "pread_into"
                         with TraceScope(self.trace, "daemon", "disk_read_into_ring_block", artifact_path=entry.artifact_path, block_index=chosen_block, file_offset=next_read_offset, valid_bytes=valid_bytes, aligned_bytes=aligned_bytes):
                             reader.read_into(payload_address, valid_bytes, aligned_bytes, next_read_offset)
+                        if valid_bytes < entry.block_payload_bytes:
+                            ctypes.memset(payload_address + valid_bytes, 0, entry.block_payload_bytes - valid_bytes)
                         self._write_block(entry, chosen_block, K_BLOCK_STATE_READY, next_read_offset, valid_bytes, sequence)
                         next_read_offset += valid_bytes
                         sequence += 1

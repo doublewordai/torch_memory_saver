@@ -179,6 +179,12 @@ New tag-scoped env default:
   - example: `tag="weights"` maps to `TMS_TAG_DISK_BACKUP_LOC_WEIGHTS`
   - example: `tag="kv_cache"` maps to `TMS_TAG_DISK_BACKUP_LOC_KV_CACHE`
 
+New consumer-side resume variable:
+
+- `TMS_RESUME_TRANSFER_MODE`
+  - `registered` (default): `cudaHostRegister` each shared ring block before DMA, pipelining registration with in-flight transfers. Best on hardware where the CUDA driver's pageable staging path is slow (observed on B200 / PCIe Gen5 with driver 580.x: ~8 GB/s staging vs ~39 GB/s pipelined).
+  - `direct`: skip registration and let the CUDA runtime stage through its internal bounce buffer. Best on hardware where the staging path already saturates PCIe (observed on RTX 4090 / PCIe Gen4 with driver 590.x: ~24 GB/s staging vs ~25 GB/s PCIe ceiling).
+
 Existing init variables still apply:
 
 - `TMS_INIT_ENABLE`

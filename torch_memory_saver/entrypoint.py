@@ -23,6 +23,8 @@ class TorchMemorySaver:
     def __init__(self):
         self._impl_ctor_kwargs = {}
         self._impl: Optional[_TorchMemorySaverImpl] = None
+        self._pause_hooks: dict[str, list] = defaultdict(list)
+        self._resume_hooks: dict[str, list] = defaultdict(list)
 
     @contextmanager
     def region(
@@ -65,14 +67,26 @@ class TorchMemorySaver:
         with self._impl.disable():
             yield
 
+    def register_pause_hook(self, tag: str, fn):
+        self._pause_hooks[tag].append(fn)
+
+    def register_resume_hook(self, tag: str, fn):
+        self._resume_hooks[tag].append(fn)
+
     def pause(self, tag: Optional[str] = None):
         """Pause memory for specific tag or all memory if tag is None"""
         self._ensure_initialized()
         self._impl.pause(tag=tag)
+        if tag is not None:
+            for fn in self._pause_hooks.get(tag, ()):
+                fn()
 
     def resume(self, tag: Optional[str] = None):
         """Resume memory for specific tag or all memory if tag is None"""
         self._ensure_initialized()
+        if tag is not None:
+            for fn in self._resume_hooks.get(tag, ()):
+                fn()
         self._impl.resume(tag=tag)
 
     # for compatibility
@@ -271,12 +285,28 @@ def _normalize_disk_backup_options(
         disk_backup_loc = disk_backup_loc or ""
         if enable_cpu_backup and disk_backup_loc:
             raise ValueError("enable_cpu_backup and disk_backup_loc are mutually exclusive")
-        return disk_backup_loc
+        return _maybe_add_rank_suffix(disk_backup_loc)
 
     if enable_cpu_backup:
         return ""
 
-    return _get_env_disk_backup_loc_for_tag(tag)
+    return _maybe_add_rank_suffix(_get_env_disk_backup_loc_for_tag(tag))
+
+
+def _maybe_add_rank_suffix(path: str) -> str:
+    if not path:
+        return path
+    try:
+        import torch.distributed as dist
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            rank = dist.get_rank()
+            stem, dot, ext = path.rpartition(".")
+            if dot:
+                return f"{stem}.rank{rank}.{ext}"
+            return f"{path}.rank{rank}"
+    except Exception:
+        pass
+    return path
 
 
 def _get_env_disk_backup_loc_for_tag(tag: str) -> str:

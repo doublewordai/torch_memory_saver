@@ -23,6 +23,7 @@
 namespace {
 
 constexpr const char* kShmDaemonSocketEnv = "TMS_SHM_DAEMON_SOCKET";
+constexpr const char* kResumeTransferModeEnv = "TMS_RESUME_TRANSFER_MODE";
 constexpr const char* kArtifactCompleteSuffix = ".complete";
 constexpr size_t kCudaHostRegisterChunkBytes = 1ull << 30;
 constexpr size_t kSharedArtifactCopyChunkBytes = 128ull * 1024ull * 1024ull;
@@ -70,6 +71,11 @@ bool should_return_host_backup(const AllocationMetadata& metadata) {
 
 std::string get_shm_daemon_socket_path() {
     return get_string_env_var(kShmDaemonSocketEnv);
+}
+
+bool use_direct_transfer_mode() {
+    static const bool direct = (get_string_env_var(kResumeTransferModeEnv) == "direct");
+    return direct;
 }
 
 std::string artifact_completion_marker_path(const std::string& artifact_path) {
@@ -331,8 +337,15 @@ std::optional<StagedArtifactInfo> lookup_staged_artifact(
 
 void destroy_shared_artifact_mapping(SharedArtifactHostMapping& mapping) {
     if (mapping.mapping_base != nullptr) {
+        if (mapping.coalesced_registered_bytes > 0) {
+            cuda_host_unregister_chunked(mapping.payload_base, mapping.coalesced_registered_bytes);
+        }
         for (size_t block_index = 0; block_index < mapping.registered_blocks.size(); ++block_index) {
             if (mapping.registered_blocks[block_index] == 0) {
+                continue;
+            }
+            size_t block_byte_offset = block_index * mapping.block_payload_bytes;
+            if (block_byte_offset < mapping.coalesced_registered_bytes) {
                 continue;
             }
             void* block_payload = shared_ring_block_payload(mapping, block_index);
@@ -342,6 +355,7 @@ void destroy_shared_artifact_mapping(SharedArtifactHostMapping& mapping) {
     }
     mapping.cuda_registered = false;
     mapping.registered_blocks.clear();
+    mapping.coalesced_registered_bytes = 0;
 
     if (mapping.mapping_base != nullptr) {
         SharedRingGlobalHeader* header = shared_ring_global_header(mapping);
@@ -483,6 +497,9 @@ size_t total_group_copies(const std::unordered_map<int, BatchMemcpyGroup>& group
 
 bool ensure_shared_ring_block_registered(SharedArtifactHostMapping& mapping, size_t block_index) {
     SIMPLE_CHECK(block_index < mapping.block_count, "Shared ring block index out of range");
+    if (use_direct_transfer_mode()) {
+        return false;
+    }
     if (mapping.registered_blocks.empty()) {
         mapping.registered_blocks.assign(mapping.block_count, 0);
     }
@@ -492,7 +509,16 @@ bool ensure_shared_ring_block_registered(SharedArtifactHostMapping& mapping, siz
     const auto start = std::chrono::steady_clock::now();
     void* block_payload = shared_ring_block_payload(mapping, block_index);
     const cudaError_t register_result = cudaHostRegister(block_payload, mapping.block_payload_bytes, cudaHostRegisterPortable);
-    SIMPLE_CHECK(register_result == cudaSuccess, "cudaHostRegister failed for shared artifact block");
+    if (register_result != cudaSuccess) {
+        std::cerr << "[torch_memory_saver.cpp] cudaHostRegister failed for shared artifact block"
+                  << " block_index=" << block_index
+                  << " block_bytes=" << mapping.block_payload_bytes
+                  << " error=" << register_result
+                  << " (" << cudaGetErrorString(register_result) << ")"
+                  << " file=" << __FILE__ << " func=" << __func__ << " line=" << __LINE__
+                  << std::endl;
+        return false;
+    }
     const auto end = std::chrono::steady_clock::now();
     mapping.registered_blocks[block_index] = 1;
     mapping.cuda_registered = true;
@@ -970,29 +996,68 @@ uint64_t consume_shared_ring_ready(
     SharedRingBlockHeader* block_headers = shared_ring_block_headers(mapping);
     size_t ready_block_count = 0;
 
+    const size_t blocks_per_span = std::max(static_cast<size_t>(1),
+        kCudaHostRegisterChunkBytes / mapping.block_payload_bytes);
+
     while (expected_file_offset < mapping.artifact_size) {
-        size_t block_index = SIZE_MAX;
-        for (size_t i = 0; i < mapping.block_count; ++i) {
-            const SharedRingBlockHeader& block = block_headers[i];
-            if (atomic_load_u32(&block.state) == static_cast<uint32_t>(SharedRingBlockState::READY) &&
-                atomic_load_u64(&block.file_offset) == expected_file_offset) {
-                block_index = i;
+        // Collect a span of contiguous READY blocks (up to 1 GiB worth).
+        std::vector<size_t> span_indices;
+        uint64_t scan_offset = expected_file_offset;
+        while (span_indices.size() < blocks_per_span && scan_offset < mapping.artifact_size) {
+            size_t block_index = SIZE_MAX;
+            for (size_t i = 0; i < mapping.block_count; ++i) {
+                const SharedRingBlockHeader& block = block_headers[i];
+                if (atomic_load_u32(&block.state) == static_cast<uint32_t>(SharedRingBlockState::READY) &&
+                    atomic_load_u64(&block.file_offset) == scan_offset) {
+                    block_index = i;
+                    break;
+                }
+            }
+            if (block_index == SIZE_MAX) {
                 break;
             }
+            span_indices.push_back(block_index);
+            scan_offset += atomic_load_u64(&block_headers[block_index].valid_bytes);
         }
-        if (block_index == SIZE_MAX) {
+        if (span_indices.empty()) {
             break;
         }
 
-        atomic_store_u32(&block_headers[block_index].state, static_cast<uint32_t>(SharedRingBlockState::READING));
-        ensure_shared_ring_block_registered(mapping, block_index);
-        std::unordered_map<int, BatchMemcpyGroup> h2d_groups;
-        collect_shared_ring_block_copies(mapping, block_index, path_items, allocation_index, allocation_offset, h2d_groups);
-        const std::vector<int> used_devices = get_used_devices(h2d_groups);
-        enqueue_batch_memcpy_async(async_memcpy_context, h2d_groups, cudaMemcpyHostToDevice);
-        record_shared_block_events(async_memcpy_context, block_index, used_devices, pending_blocks);
-        ready_block_count += 1;
-        expected_file_offset += atomic_load_u64(&block_headers[block_index].valid_bytes);
+        // Register the span as one contiguous region.
+        if (!use_direct_transfer_mode() && !span_indices.empty()) {
+            size_t first = span_indices.front();
+            size_t span_bytes = span_indices.size() * mapping.block_payload_bytes;
+            void* span_base = shared_ring_block_payload(mapping, first);
+            const auto reg_start = std::chrono::steady_clock::now();
+            if (cuda_host_register_chunked(span_base, span_bytes, cudaHostRegisterPortable)) {
+                mapping.coalesced_registered_bytes += span_bytes;
+                if (mapping.registered_blocks.empty()) {
+                    mapping.registered_blocks.assign(mapping.block_count, 0);
+                }
+                for (size_t idx : span_indices) {
+                    mapping.registered_blocks[idx] = 1;
+                }
+                mapping.cuda_registered = true;
+            }
+            const auto reg_end = std::chrono::steady_clock::now();
+            std::cout << "[torch_memory_saver.cpp] span registration"
+                      << " blocks=" << span_indices.size()
+                      << " bytes=" << span_bytes
+                      << " elapsed_ms=" << duration_ms(reg_start, reg_end)
+                      << std::endl;
+        }
+
+        // Dispatch DMA for all blocks in the span.
+        for (size_t block_index : span_indices) {
+            atomic_store_u32(&block_headers[block_index].state, static_cast<uint32_t>(SharedRingBlockState::READING));
+            std::unordered_map<int, BatchMemcpyGroup> h2d_groups;
+            collect_shared_ring_block_copies(mapping, block_index, path_items, allocation_index, allocation_offset, h2d_groups);
+            const std::vector<int> used_devices = get_used_devices(h2d_groups);
+            enqueue_batch_memcpy_async(async_memcpy_context, h2d_groups, cudaMemcpyHostToDevice);
+            record_shared_block_events(async_memcpy_context, block_index, used_devices, pending_blocks);
+            ready_block_count += 1;
+            expected_file_offset += atomic_load_u64(&block_headers[block_index].valid_bytes);
+        }
     }
 
     const auto end = std::chrono::steady_clock::now();
@@ -1431,6 +1496,13 @@ void TorchMemorySaver::resume(const std::string& tag) {
     ROCmHIPImplementation::rocm_resume(tag, allocation_metadata_, allocator_metadata_mutex_);
 
 #else
+    static std::once_flag transfer_mode_log;
+    std::call_once(transfer_mode_log, []() {
+        const bool direct = use_direct_transfer_mode();
+        std::cout << "[torch_memory_saver.cpp] resume transfer_mode="
+                  << (direct ? "direct" : "registered") << std::endl;
+    });
+
     std::vector<AllocationRef> matching_items;
     std::unordered_map<std::string, std::vector<AllocationRef>> disk_items_by_path;
     std::unordered_map<std::string, std::vector<AllocationRef>> shared_items_by_path;
