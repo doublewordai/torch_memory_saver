@@ -345,19 +345,31 @@ void destroy_shared_artifact_mapping(SharedArtifactHostMapping& mapping) {
     // free. For long-lived processes doing many in-process sleep/wake cycles it
     // can slowly accumulate driver state; batch-deferring the unregister or
     // keeping the mapping pinned across cycles would address that when needed.
+    const auto _tms_destroy_start = std::chrono::steady_clock::now();
+    const size_t _tms_destroy_block_count = mapping.registered_blocks.size();
     mapping.cuda_registered = false;
     mapping.registered_blocks.clear();
 
     if (mapping.mapping_base != nullptr) {
         SharedRingGlobalHeader* header = shared_ring_global_header(mapping);
         atomic_store_u32(&header->consumer_state, static_cast<uint32_t>(SharedRingConsumerState::DONE));
+        const auto _tms_munmap_start = std::chrono::steady_clock::now();
         SIMPLE_CHECK(munmap(mapping.mapping_base, mapping.mapped_size) == 0, "munmap failed for shared artifact mapping");
+        const auto _tms_munmap_end = std::chrono::steady_clock::now();
+        std::cout << "[torch_memory_saver.cpp] TIMING destroy_mapping.munmap"
+                  << " bytes=" << mapping.mapped_size
+                  << " elapsed_ms=" << duration_ms(_tms_munmap_start, _tms_munmap_end)
+                  << std::endl;
         mapping.mapping_base = nullptr;
         mapping.payload_base = nullptr;
     }
 
     if (mapping.shm_fd >= 0) {
+        const auto _tms_close_start = std::chrono::steady_clock::now();
         SIMPLE_CHECK(close(mapping.shm_fd) == 0, "close failed for shared artifact mapping");
+        const auto _tms_close_end = std::chrono::steady_clock::now();
+        std::cout << "[torch_memory_saver.cpp] TIMING destroy_mapping.close elapsed_ms="
+                  << duration_ms(_tms_close_start, _tms_close_end) << std::endl;
         mapping.shm_fd = -1;
     }
 
@@ -368,6 +380,12 @@ void destroy_shared_artifact_mapping(SharedArtifactHostMapping& mapping) {
     mapping.block_count = 0;
     mapping.shm_name.clear();
     mapping.completion_token.clear();
+
+    const auto _tms_destroy_end = std::chrono::steady_clock::now();
+    std::cout << "[torch_memory_saver.cpp] TIMING destroy_mapping.TOTAL"
+              << " skipped_blocks=" << _tms_destroy_block_count
+              << " elapsed_ms=" << duration_ms(_tms_destroy_start, _tms_destroy_end)
+              << std::endl;
 }
 
 bool ensure_shared_artifact_mapping(
@@ -645,13 +663,27 @@ void enqueue_batch_memcpy_async(
 }
 
 void synchronize_and_destroy_async_memcpy_context(AsyncMemcpyContext& context) {
+    const auto _tms_sync_start = std::chrono::steady_clock::now();
+    const size_t _tms_stream_count = context.streams_by_device.size();
     for (const auto& entry : context.streams_by_device) {
+        const auto _tms_per_stream_start = std::chrono::steady_clock::now();
         CUDA_ERROR_CHECK(cudaSetDevice(entry.first));
         CUDA_ERROR_CHECK(cudaStreamSynchronize(entry.second));
+        const auto _tms_per_stream_sync_end = std::chrono::steady_clock::now();
         CUDA_ERROR_CHECK(cudaStreamDestroy(entry.second));
+        const auto _tms_per_stream_end = std::chrono::steady_clock::now();
+        std::cout << "[torch_memory_saver.cpp] TIMING sync_memcpy.stream"
+                  << " device=" << entry.first
+                  << " sync_ms=" << duration_ms(_tms_per_stream_start, _tms_per_stream_sync_end)
+                  << " destroy_ms=" << duration_ms(_tms_per_stream_sync_end, _tms_per_stream_end)
+                  << std::endl;
     }
     context.streams_by_device.clear();
     CUDA_ERROR_CHECK(cudaSetDevice(context.original_device));
+    const auto _tms_sync_end = std::chrono::steady_clock::now();
+    std::cout << "[torch_memory_saver.cpp] TIMING sync_memcpy.TOTAL streams="
+              << _tms_stream_count
+              << " elapsed_ms=" << duration_ms(_tms_sync_start, _tms_sync_end) << std::endl;
 }
 
 void record_shared_block_events(
@@ -1321,6 +1353,7 @@ cudaError_t TorchMemorySaver::free(void *ptr) {
 }
 
 void TorchMemorySaver::pause(const std::string& tag) {
+    const auto _tms_pause_start = std::chrono::steady_clock::now();
 #if TMS_ROCM_LEGACY_CHUNKED
     ROCmHIPImplementation::rocm_pause(tag, allocation_metadata_, allocator_metadata_mutex_);
 
@@ -1422,16 +1455,27 @@ void TorchMemorySaver::pause(const std::string& tag) {
 
     }
 
+    const auto _tms_pause_cleanup_start = std::chrono::steady_clock::now();
     for (const auto& state : prefetch_states_to_destroy) {
         DiskOffload::destroy_prefetch_state(state);
     }
     for (auto& mapping : shared_mappings_to_destroy) {
         destroy_shared_artifact_mapping(mapping);
     }
+    const auto _tms_pause_cleanup_end = std::chrono::steady_clock::now();
+    std::cout << "[torch_memory_saver.cpp] TIMING pause.cleanup"
+              << " prefetch_states=" << prefetch_states_to_destroy.size()
+              << " shared_mappings=" << shared_mappings_to_destroy.size()
+              << " elapsed_ms=" << duration_ms(_tms_pause_cleanup_start, _tms_pause_cleanup_end)
+              << std::endl;
 #endif
+    const auto _tms_pause_end = std::chrono::steady_clock::now();
+    std::cout << "[torch_memory_saver.cpp] TIMING pause.TOTAL tag=" << tag
+              << " elapsed_ms=" << duration_ms(_tms_pause_start, _tms_pause_end) << std::endl;
 }
 
 void TorchMemorySaver::resume(const std::string& tag) {
+    const auto _tms_resume_start = std::chrono::steady_clock::now();
 #if TMS_ROCM_LEGACY_CHUNKED
     ROCmHIPImplementation::rocm_resume(tag, allocation_metadata_, allocator_metadata_mutex_);
 
@@ -1615,8 +1659,13 @@ void TorchMemorySaver::resume(const std::string& tag) {
         );
     }
 
+    const auto _tms_sync_call_start = std::chrono::steady_clock::now();
     synchronize_and_destroy_async_memcpy_context(async_memcpy_context);
+    const auto _tms_sync_call_end = std::chrono::steady_clock::now();
+    std::cout << "[torch_memory_saver.cpp] TIMING resume.sync_memcpy_call elapsed_ms="
+              << duration_ms(_tms_sync_call_start, _tms_sync_call_end) << std::endl;
 
+    const auto _tms_metadata_start = std::chrono::steady_clock::now();
     {
         const std::lock_guard<std::mutex> lock(allocator_metadata_mutex_);
         for (const AllocationRef& item : matching_items) {
@@ -1647,9 +1696,20 @@ void TorchMemorySaver::resume(const std::string& tag) {
         }
     }
 
+    const auto _tms_metadata_end = std::chrono::steady_clock::now();
+    std::cout << "[torch_memory_saver.cpp] TIMING resume.metadata_cleanup elapsed_ms="
+              << duration_ms(_tms_metadata_start, _tms_metadata_end) << std::endl;
+
+    const auto _tms_destroy_loop_start = std::chrono::steady_clock::now();
+    const size_t _tms_destroy_count = shared_mappings_to_destroy.size();
     for (auto& mapping : shared_mappings_to_destroy) {
         destroy_shared_artifact_mapping(mapping);
     }
+    const auto _tms_destroy_loop_end = std::chrono::steady_clock::now();
+    std::cout << "[torch_memory_saver.cpp] TIMING resume.destroy_mappings_loop"
+              << " mappings=" << _tms_destroy_count
+              << " elapsed_ms=" << duration_ms(_tms_destroy_loop_start, _tms_destroy_loop_end)
+              << std::endl;
 
     // Destroy prefetch states in a detached thread to avoid blocking resume
     // on cudaFreeHost of pinned ring buffer memory.
@@ -1662,6 +1722,9 @@ void TorchMemorySaver::resume(const std::string& tag) {
     }
 
 #endif
+    const auto _tms_resume_end = std::chrono::steady_clock::now();
+    std::cout << "[torch_memory_saver.cpp] TIMING resume.TOTAL tag=" << tag
+              << " elapsed_ms=" << duration_ms(_tms_resume_start, _tms_resume_end) << std::endl;
 }
 
 uint8_t* TorchMemorySaver::get_cpu_backup_pointer(const uint8_t* query_gpu_ptr, uint64_t query_size) {
