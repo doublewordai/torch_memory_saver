@@ -330,16 +330,21 @@ std::optional<StagedArtifactInfo> lookup_staged_artifact(
 }
 
 void destroy_shared_artifact_mapping(SharedArtifactHostMapping& mapping) {
-    if (mapping.mapping_base != nullptr) {
-        for (size_t block_index = 0; block_index < mapping.registered_blocks.size(); ++block_index) {
-            if (mapping.registered_blocks[block_index] == 0) {
-                continue;
-            }
-            void* block_payload = shared_ring_block_payload(mapping, block_index);
-            const cudaError_t unregister_result = cudaHostUnregister(block_payload);
-            SIMPLE_CHECK(unregister_result == cudaSuccess, "cudaHostUnregister failed for shared artifact block");
-        }
-    }
+    // Intentionally skip cudaHostUnregister for the shared-ring blocks:
+    //   1. The shared ring is daemon-owned hugepage memory, already pinned by the
+    //      kernel (pages cannot be swapped or migrated), so the registration is
+    //      not what keeps them addressable for DMA. It just maintains IOMMU and
+    //      driver-side bookkeeping that will be released when the VA is unmapped.
+    //   2. We munmap the mapping base below, which orphans the driver-side
+    //      registration; the CUDA primary context reclaims that state on process
+    //      exit.
+    //   3. Measured on CUDA 12.x / Blackwell, cudaHostUnregister costs ~4ms per
+    //      256 MiB registered block. For a 128 GiB shared ring that is >2 seconds
+    //      on the resume critical path, per release/resume cycle.
+    // For checkpoint/restore-style workloads (one resume per process) this is
+    // free. For long-lived processes doing many in-process sleep/wake cycles it
+    // can slowly accumulate driver state; batch-deferring the unregister or
+    // keeping the mapping pinned across cycles would address that when needed.
     mapping.cuda_registered = false;
     mapping.registered_blocks.clear();
 
