@@ -6,7 +6,7 @@ import traceback
 import torch_memory_saver
 from torch_memory_saver.utils import change_env
 
-from examples import simple, cuda_graph, cpu_backup, rl_example, multi_device, training_engine, nested_region, disk_backups
+from examples import simple, cuda_graph, cpu_backup, rl_example, multi_device, training_engine, nested_region, disk_backups, shm_daemon
 
 _HOOK_MODES = ["preload", "torch"]
 
@@ -33,6 +33,10 @@ def test_multi_device(hook_mode):
 
 def test_disk_backups():
     _test_core(disk_backups.run, hook_mode="torch")
+
+
+def test_shm_daemon():
+    _test_core(shm_daemon.run, hook_mode="torch")
 
 
 @pytest.mark.parametrize("hook_mode", _HOOK_MODES)

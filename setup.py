@@ -156,4 +156,9 @@ setup(
     cmdclass={'build_ext': build_ext_for_platform},
     python_requires=">=3.9",
     packages=setuptools.find_packages(include=["torch_memory_saver", "torch_memory_saver.*"]),
+    entry_points={
+        "console_scripts": [
+            "torch-memory-saver-shm-daemon=torch_memory_saver.shm_stager_daemon:main",
+        ],
+    },
 )

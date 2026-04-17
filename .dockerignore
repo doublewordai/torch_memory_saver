@@ -1,0 +1,11 @@
+.git
+.gitignore
+.venv
+.pytest_cache
+__pycache__
+*.pyc
+build
+dist
+torch_memory_saver.egg-info
+.benchmarks
+test
