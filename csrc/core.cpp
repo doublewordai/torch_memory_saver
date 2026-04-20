@@ -318,9 +318,17 @@ std::optional<StagedArtifactInfo> lookup_staged_artifact(
     const std::string& artifact_path,
     uint64_t artifact_size
 ) {
-    const std::string expected_token = read_artifact_completion_token(artifact_path);
     std::optional<StagedArtifactInfo> staged = lookup_staged_artifact_once(artifact_path, artifact_size);
-    if (staged.has_value() && (expected_token.empty() || staged->completion_token == expected_token)) {
+    if (staged.has_value()) {
+        std::cout << "[torch_memory_saver.cpp] daemon lookup accepted staged mapping"
+                  << " path=" << artifact_path
+                  << " artifact_bytes=" << artifact_size
+                  << " shm_name=" << staged->shm_name
+                  << " staged_file_bytes=" << staged->artifact_size
+                  << " mapped_bytes=" << staged->mapped_size
+                  << " block_bytes=" << staged->block_payload_bytes
+                  << " block_count=" << staged->block_count
+                  << std::endl;
         return staged;
     }
     if (staged.has_value() && staged->shm_fd >= 0) {
@@ -394,6 +402,10 @@ bool ensure_shared_artifact_mapping(
     uint64_t artifact_size
 ) {
     const auto lookup_start = std::chrono::steady_clock::now();
+    std::cout << "[torch_memory_saver.cpp] ensure shared artifact mapping"
+              << " path=" << artifact_path
+              << " artifact_bytes=" << artifact_size
+              << std::endl;
     const std::optional<StagedArtifactInfo> staged = lookup_staged_artifact(artifact_path, artifact_size);
     const auto lookup_end = std::chrono::steady_clock::now();
     if (!staged.has_value()) {
@@ -403,7 +415,6 @@ bool ensure_shared_artifact_mapping(
     SharedArtifactHostMapping& mapping = shared_artifact_mappings[artifact_path];
     if (mapping.mapping_base != nullptr &&
         mapping.shm_name == staged->shm_name &&
-        mapping.completion_token == staged->completion_token &&
         mapping.artifact_size == artifact_size &&
         mapping.mapped_size == staged->mapped_size &&
         mapping.block_count == staged->block_count &&
@@ -1518,12 +1529,25 @@ void TorchMemorySaver::resume(const std::string& tag) {
         for (auto& entry : disk_items_by_path) {
             const std::string& path = entry.first;
             const uint64_t total_artifact_bytes = DiskOffload::total_size(entry.second);
+            std::cout << "[torch_memory_saver.cpp] resume path candidate"
+                      << " path=" << path
+                      << " artifact_bytes=" << total_artifact_bytes
+                      << " allocations=" << entry.second.size()
+                      << std::endl;
             if (ensure_shared_artifact_mapping(shared_artifact_mappings_, path, total_artifact_bytes)) {
+                std::cout << "[torch_memory_saver.cpp] resume using shared artifact path"
+                          << " path=" << path
+                          << " artifact_bytes=" << total_artifact_bytes
+                          << std::endl;
                 shared_items_by_path.emplace(path, entry.second);
                 shared_backed_paths.push_back(path);
                 continue;
             }
 
+            std::cout << "[torch_memory_saver.cpp] resume falling back to disk prefetch"
+                      << " path=" << path
+                      << " artifact_bytes=" << total_artifact_bytes
+                      << std::endl;
             auto state_it = disk_prefetch_states_.find(path);
             if (state_it == disk_prefetch_states_.end()) {
                 state_it = disk_prefetch_states_.emplace(path, DiskOffload::create_prefetch_state(path, total_artifact_bytes)).first;
