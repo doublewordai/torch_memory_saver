@@ -336,27 +336,16 @@ std::optional<StagedArtifactInfo> lookup_staged_artifact(
 }
 
 void destroy_shared_artifact_mapping(SharedArtifactHostMapping& mapping) {
-    if (mapping.mapping_base != nullptr) {
-        if (mapping.coalesced_registered_bytes > 0) {
-            cuda_host_unregister_chunked(mapping.payload_base, mapping.coalesced_registered_bytes);
-        }
-        for (size_t block_index = 0; block_index < mapping.registered_blocks.size(); ++block_index) {
-            if (mapping.registered_blocks[block_index] == 0) {
-                continue;
-            }
-            size_t block_byte_offset = block_index * mapping.block_payload_bytes;
-            if (block_byte_offset < mapping.coalesced_registered_bytes) {
-                continue;
-            }
-            void* block_payload = shared_ring_block_payload(mapping, block_index);
-            const cudaError_t unregister_result = cudaHostUnregister(block_payload);
-            SIMPLE_CHECK(unregister_result == cudaSuccess, "cudaHostUnregister failed for shared artifact block");
-        }
-    }
+    const auto destroy_start = std::chrono::steady_clock::now();
+    /* Skip explicit cudaHostUnregister — the CUDA driver automatically
+     * deregisters pinned memory when the mapping is munmap'd below. The
+     * explicit unregister was taking ~1-2s synchronously (blocks × ~4-5ms
+     * each) and serializing behind all other CUDA work on the device. */
     mapping.cuda_registered = false;
     mapping.registered_blocks.clear();
     mapping.coalesced_registered_bytes = 0;
 
+    const auto munmap_start = std::chrono::steady_clock::now();
     if (mapping.mapping_base != nullptr) {
         SharedRingGlobalHeader* header = shared_ring_global_header(mapping);
         atomic_store_u32(&header->consumer_state, static_cast<uint32_t>(SharedRingConsumerState::DONE));
@@ -364,11 +353,17 @@ void destroy_shared_artifact_mapping(SharedArtifactHostMapping& mapping) {
         mapping.mapping_base = nullptr;
         mapping.payload_base = nullptr;
     }
+    const auto munmap_end = std::chrono::steady_clock::now();
 
     if (mapping.shm_fd >= 0) {
         SIMPLE_CHECK(close(mapping.shm_fd) == 0, "close failed for shared artifact mapping");
         mapping.shm_fd = -1;
     }
+
+    std::cout << "[torch_memory_saver.cpp] shared mapping destroyed"
+              << " munmap_ms=" << duration_ms(munmap_start, munmap_end)
+              << " total_ms=" << duration_ms(destroy_start, std::chrono::steady_clock::now())
+              << std::endl;
 
     mapping.artifact_size = 0;
     mapping.mapped_size = 0;
@@ -1655,10 +1650,13 @@ void TorchMemorySaver::resume(const std::string& tag) {
         disk_resume_states.push_back(std::move(drs));
     }
 
+    const auto initial_h2d_start = std::chrono::steady_clock::now();
     const bool allow_batched_h2d = true;
     run_batch_memcpy(h2d_groups, cudaMemcpyHostToDevice, allow_batched_h2d, "resume_initial_h2d");
+    const auto initial_h2d_end = std::chrono::steady_clock::now();
 
     // Phase 2: consume the shared ring and any remaining disk slots.
+    const auto remaining_shared_start = std::chrono::steady_clock::now();
     for (auto& srs : shared_resume_states) {
         consume_shared_ring_remaining(
             *srs.mapping,
@@ -1670,7 +1668,9 @@ void TorchMemorySaver::resume(const std::string& tag) {
             srs.pending_blocks
         );
     }
+    const auto remaining_shared_end = std::chrono::steady_clock::now();
 
+    const auto remaining_disk_start = std::chrono::steady_clock::now();
     for (auto& drs : disk_resume_states) {
         consume_disk_prefetch_remaining_async(
             async_memcpy_context,
@@ -1681,9 +1681,14 @@ void TorchMemorySaver::resume(const std::string& tag) {
             drs.resume_offset
         );
     }
+    const auto remaining_disk_end = std::chrono::steady_clock::now();
 
+    const auto sync_start = std::chrono::steady_clock::now();
     synchronize_and_destroy_async_memcpy_context(async_memcpy_context);
+    const auto sync_end = std::chrono::steady_clock::now();
 
+    size_t cpu_backups_freed = 0;
+    const auto cpu_backup_free_start = std::chrono::steady_clock::now();
     {
         const std::lock_guard<std::mutex> lock(allocator_metadata_mutex_);
         for (const AllocationRef& item : matching_items) {
@@ -1695,6 +1700,7 @@ void TorchMemorySaver::resume(const std::string& tag) {
             if (metadata.enable_cpu_backup) {
                 CUDA_ERROR_CHECK(cudaFreeHost(metadata.cpu_backup));
                 metadata.cpu_backup = nullptr;
+                cpu_backups_freed += 1;
             }
         }
 
@@ -1713,13 +1719,17 @@ void TorchMemorySaver::resume(const std::string& tag) {
             }
         }
     }
+    const auto cpu_backup_free_end = std::chrono::steady_clock::now();
 
+    const auto destroy_mappings_start = std::chrono::steady_clock::now();
     for (auto& mapping : shared_mappings_to_destroy) {
         destroy_shared_artifact_mapping(mapping);
     }
+    const auto destroy_mappings_end = std::chrono::steady_clock::now();
 
     // Destroy prefetch states in a detached thread to avoid blocking resume
     // on cudaFreeHost of pinned ring buffer memory.
+    const auto detach_prefetch_start = std::chrono::steady_clock::now();
     if (!states_to_destroy.empty()) {
         std::thread([states = std::move(states_to_destroy)]() {
             for (const auto& state : states) {
@@ -1727,6 +1737,22 @@ void TorchMemorySaver::resume(const std::string& tag) {
             }
         }).detach();
     }
+    const auto detach_prefetch_end = std::chrono::steady_clock::now();
+
+    std::cout << "[torch_memory_saver.cpp] resume phase timing"
+              << " tag=" << tag
+              << " matching_items=" << matching_items.size()
+              << " remap_ms=" << duration_ms(remap_start, remap_end)
+              << " initial_h2d_ms=" << duration_ms(initial_h2d_start, initial_h2d_end)
+              << " remaining_shared_ms=" << duration_ms(remaining_shared_start, remaining_shared_end)
+              << " remaining_disk_ms=" << duration_ms(remaining_disk_start, remaining_disk_end)
+              << " sync_ms=" << duration_ms(sync_start, sync_end)
+              << " cpu_backup_free_ms=" << duration_ms(cpu_backup_free_start, cpu_backup_free_end)
+              << " cpu_backups_freed=" << cpu_backups_freed
+              << " destroy_mappings_ms=" << duration_ms(destroy_mappings_start, destroy_mappings_end)
+              << " detach_prefetch_ms=" << duration_ms(detach_prefetch_start, detach_prefetch_end)
+              << " total_ms=" << duration_ms(remap_start, detach_prefetch_end)
+              << std::endl;
 
 #endif
 }
